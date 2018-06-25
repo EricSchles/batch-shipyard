@@ -1572,6 +1572,25 @@ def credentials_management(config):
     )
 
 
+def parse_batch_service_url(account_service_url, test_cluster=False):
+    # type: (str, bool) -> Tuple[str, str]
+    """Parse batch service url into account name and location
+    :param str account_service_url: account url
+    :param bool test_cluster: test cluster
+    :rtype: tuple
+    :return: account, location
+    """
+    # parse location from url
+    tmp = account_service_url.split('.')
+    location = tmp[1].lower()
+    # parse account name from url
+    if test_cluster:
+        account = account_service_url.split('/')[-1]
+    else:
+        account = tmp[0].split('/')[-1]
+    return account, location
+
+
 def credentials_batch(config):
     # type: (dict) -> BatchCredentialsSettings
     """Get Batch credentials
@@ -1595,14 +1614,8 @@ def credentials_batch(config):
             creds['management'], 'subscription_id')
     except (KeyError, TypeError):
         subscription_id = None
-    # parse location from url
-    tmp = account_service_url.split('.')
-    location = tmp[1]
-    # parse account name from url
-    if test_cluster:
-        account = account_service_url.split('/')[-1]
-    else:
-        account = tmp[0].split('/')[-1]
+    account, location = parse_batch_service_url(
+        account_service_url, test_cluster=test_cluster)
     aad = _aad_credentials(
         creds,
         'batch',
@@ -4297,16 +4310,14 @@ def monitoring_settings(config):
         if util.is_none_or_empty(conf):
             raise KeyError
     except KeyError:
-        raise ValueError(
-            'monitoring settings are invalid or missing from global '
-            'configuration')
+        raise ValueError('monitoring settings are invalid')
     location = conf['location']
     if util.is_none_or_empty(location):
-        raise ValueError('invalid location in monitoring:batch')
+        raise ValueError('invalid location in monitoring')
     # monitoring vm settings
     rg = _kv_read_checked(conf, 'resource_group')
     if util.is_none_or_empty(rg):
-        raise ValueError('invalid resource_group in monitoring:batch')
+        raise ValueError('invalid resource_group in monitoring')
     vm_size = _kv_read_checked(conf, 'vm_size')
     hostname_prefix = _kv_read_checked(conf, 'hostname_prefix')
     accel_net = _kv_read(conf, 'accelerated_networking', False)
@@ -4351,17 +4362,115 @@ def monitoring_settings(config):
                 raise ValueError(
                     'expected list for prometheus network security rule')
     if 'custom_inbound_rules' in ns_conf:
-        # reserve keywords (current and expected possible future support)
-        _reserved = frozenset([
-            'ssh', 'nfs', 'glusterfs', 'smb', 'cifs', 'samba', 'zfs',
-            'beegfs', 'cephfs',
-        ])
         for key in ns_conf['custom_inbound_rules']:
-            # ensure key is not reserved
-            if key.lower() in _reserved:
+            ns_inbound[key] = InboundNetworkSecurityRule(
+                destination_port_range=_kv_read_checked(
+                    ns_conf['custom_inbound_rules'][key],
+                    'destination_port_range'),
+                source_address_prefix=_kv_read_checked(
+                    ns_conf['custom_inbound_rules'][key],
+                    'source_address_prefix'),
+                protocol=_kv_read_checked(
+                    ns_conf['custom_inbound_rules'][key], 'protocol'),
+            )
+            if not isinstance(ns_inbound[key].source_address_prefix, list):
                 raise ValueError(
-                    ('custom inbound rule of name {} conflicts with a '
-                     'reserved name {}').format(key, _reserved))
+                    'expected list for network security rule {} '
+                    'source_address_prefix'.format(key))
+    # ssh settings
+    ssh_conf = conf['ssh']
+    ssh_username = _kv_read_checked(ssh_conf, 'username')
+    ssh_public_key = _kv_read_checked(ssh_conf, 'ssh_public_key')
+    if util.is_not_empty(ssh_public_key):
+        ssh_public_key = pathlib.Path(ssh_public_key)
+    ssh_public_key_data = _kv_read_checked(ssh_conf, 'ssh_public_key_data')
+    ssh_private_key = _kv_read_checked(ssh_conf, 'ssh_private_key')
+    if util.is_not_empty(ssh_private_key):
+        ssh_private_key = pathlib.Path(ssh_private_key)
+    if (ssh_public_key is not None and
+            util.is_not_empty(ssh_public_key_data)):
+        raise ValueError('cannot specify both an SSH public key file and data')
+    if (ssh_public_key is None and
+            util.is_none_or_empty(ssh_public_key_data) and
+            ssh_private_key is not None):
+        raise ValueError(
+            'cannot specify an SSH private key with no public key specified')
+    ssh_gen_file_path = _kv_read_checked(
+        ssh_conf, 'generated_file_export_path', '.')
+    return VmResource(
+        location=location,
+        resource_group=rg,
+        hostname_prefix=hostname_prefix,
+        virtual_network=virtual_network_settings(
+            conf,
+            default_resource_group=rg,
+            default_existing_ok=False,
+            default_create_nonexistant=True,
+        ),
+        network_security=NetworkSecuritySettings(
+            inbound=ns_inbound,
+        ),
+        vm_size=vm_size,
+        accelerated_networking=accel_net,
+        public_ip=PublicIpSettings(
+            enabled=pip_enabled,
+            static=pip_static,
+        ),
+        ssh=SSHSettings(
+            username=ssh_username,
+            expiry_days=9999,
+            ssh_public_key=ssh_public_key,
+            ssh_public_key_data=ssh_public_key_data,
+            ssh_private_key=ssh_private_key,
+            generate_docker_tunnel_script=False,
+            generated_file_export_path=ssh_gen_file_path,
+            hpn_server_swap=False,
+            allow_docker_access=False,
+        ),
+    )
+
+
+def federation_settings(config):
+    # type: (dict) -> VmResource
+    """Get federation settings
+    :param dict config: configuration dict
+    :rtype: VmResource
+    :return: VM resource settings
+    """
+    # general settings
+    try:
+        conf = config['federation']
+        if util.is_none_or_empty(conf):
+            raise KeyError
+    except KeyError:
+        raise ValueError('federation settings are invalid or missing')
+    location = conf['location']
+    if util.is_none_or_empty(location):
+        raise ValueError('invalid location in federation')
+    # vm settings
+    rg = _kv_read_checked(conf, 'resource_group')
+    if util.is_none_or_empty(rg):
+        raise ValueError('invalid resource_group in federation')
+    vm_size = _kv_read_checked(conf, 'vm_size')
+    hostname_prefix = _kv_read_checked(conf, 'hostname_prefix')
+    accel_net = _kv_read(conf, 'accelerated_networking', False)
+    # public ip settings
+    pip_conf = _kv_read_checked(conf, 'public_ip', {})
+    pip_enabled = _kv_read(pip_conf, 'enabled', True)
+    pip_static = _kv_read(pip_conf, 'static', False)
+    # sc network security settings
+    ns_conf = conf['network_security']
+    ns_inbound = {
+        'ssh': InboundNetworkSecurityRule(
+            destination_port_range='22',
+            source_address_prefix=_kv_read_checked(ns_conf, 'ssh', ['*']),
+            protocol='tcp',
+        ),
+    }
+    if not isinstance(ns_inbound['ssh'].source_address_prefix, list):
+        raise ValueError('expected list for ssh network security rule')
+    if 'custom_inbound_rules' in ns_conf:
+        for key in ns_conf['custom_inbound_rules']:
             ns_inbound[key] = InboundNetworkSecurityRule(
                 destination_port_range=_kv_read_checked(
                     ns_conf['custom_inbound_rules'][key],

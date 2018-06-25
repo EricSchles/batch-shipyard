@@ -40,6 +40,7 @@ import azure.common
 import azure.cosmosdb.table as azuretable
 import azure.storage.blob as azureblob
 import azure.storage.file as azurefile
+import azure.storage.queue as azurequeue
 # local imports
 from . import settings
 from . import util
@@ -62,12 +63,16 @@ _STORAGE_CONTAINERS = {
     'blob_torrents': None,
     'blob_remotefs': None,
     'blob_monitoring': None,
+    'blob_federation_jobs': None,
     'table_dht': None,
     'table_torrentinfo': None,
     'table_images': None,
     'table_globalresources': None,
-    'table_monitoring': None,
     'table_perf': None,
+    'table_monitoring': None,
+    'table_federation_jobs': None,
+    'table_federation_pools': None,
+    'queue_federation_jobs': None,
     # TODO remove following in future release
     'table_registry': None,
 }
@@ -96,12 +101,16 @@ def set_storage_configuration(sep, postfix, sa, sakey, saep, sasexpiry):
         (sep + 'tor', postfix))
     _STORAGE_CONTAINERS['blob_remotefs'] = sep + 'remotefs'
     _STORAGE_CONTAINERS['blob_monitoring'] = sep + 'monitor'
+    _STORAGE_CONTAINERS['blob_federation_jobs'] = sep + 'fedjobs'
     _STORAGE_CONTAINERS['table_dht'] = sep + 'dht'
     _STORAGE_CONTAINERS['table_torrentinfo'] = sep + 'torrentinfo'
     _STORAGE_CONTAINERS['table_images'] = sep + 'images'
     _STORAGE_CONTAINERS['table_globalresources'] = sep + 'gr'
-    _STORAGE_CONTAINERS['table_monitoring'] = sep + 'monitor'
     _STORAGE_CONTAINERS['table_perf'] = sep + 'perf'
+    _STORAGE_CONTAINERS['table_monitoring'] = sep + 'monitor'
+    _STORAGE_CONTAINERS['table_federation_jobs'] = sep + 'fedjobs'
+    _STORAGE_CONTAINERS['table_federation_pools'] = sep + 'fedpools'
+    _STORAGE_CONTAINERS['queue_federation_jobs'] = sep + 'fedjobs'
     # TODO remove following containers in future release
     _STORAGE_CONTAINERS['table_registry'] = sep + 'registry'
     # ensure all storage containers are between 3 and 63 chars in length
@@ -167,6 +176,15 @@ def get_storage_table_monitoring():
     :return: table name for monitoring
     """
     return _STORAGE_CONTAINERS['table_monitoring']
+
+
+def get_storage_table_federation_pools():
+    # type: (None) -> str
+    """Get the table associated with monitoring
+    :rtype: str
+    :return: table name for monitoring
+    """
+    return _STORAGE_CONTAINERS['table_federation_pools']
 
 
 def populate_storage_account_keys_from_aad(storage_mgmt_client, config):
@@ -598,6 +616,46 @@ def remove_resources_from_monitoring(
                         sc_id))
 
 
+def add_pool_to_federation(
+        table_client, config, federation_id, batch_service_url, pools):
+    # type: (azuretable.TableService, dict, str, str, List[str]) -> None
+    """Populate federation with pools
+    :param azure.cosmosdb.table.TableService table_client: table client
+    :param dict config: configuration dict
+    :param str federation_id: federation id
+    :param str batch_service_url: batch service url to associate
+    :param list pools: pools to monitor
+    """
+    if util.is_not_empty(batch_service_url):
+        account, location = settings.parse_batch_service_url(
+            batch_service_url)
+    else:
+        bc = settings.credentials_batch(config)
+        batch_service_url = bc.account_service_url
+        account, location = settings.parse_batch_service_url(
+            batch_service_url)
+    for poolid in pools:
+        entity = {
+            'PartitionKey': federation_id,
+            'RowKey': '{}${}'.format(account, poolid),
+            'Location': location,
+            'BatchServiceUrl': batch_service_url,
+        }
+        if settings.verbose(config):
+            logger.debug(
+                'inserting pool federation entity: {}'.format(
+                    entity))
+        try:
+            table_client.insert_entity(
+                _STORAGE_CONTAINERS['table_federation_pools'], entity)
+        except azure.common.AzureConflictHttpError:
+            logger.error('federation entity for pool {} already exists'.format(
+                poolid))
+        else:
+            logger.debug('federation entity added for pool {}'.format(
+                poolid))
+
+
 def _check_file_and_upload(blob_client, file, container):
     # type: (azure.storage.blob.BlockBlobService, tuple, str) -> None
     """Upload file to blob storage if necessary
@@ -662,13 +720,15 @@ def upload_for_nonbatch(blob_client, files, kind):
     :rtype: list
     :return: list of file urls
     """
-    kind = 'blob_{}'.format(kind.lower())
+    if kind == 'federation':
+        kind = '{}_jobs'.format(kind.lower())
+    key = 'blob_{}'.format(kind.lower())
     ret = []
     for file in files:
-        _check_file_and_upload(blob_client, file, kind)
+        _check_file_and_upload(blob_client, file, key)
         ret.append('https://{}.blob.{}/{}/{}'.format(
             _STORAGEACCOUNT, _STORAGEACCOUNTEP,
-            _STORAGE_CONTAINERS[kind], file[0]))
+            _STORAGE_CONTAINERS[key], file[0]))
     return ret
 
 
@@ -688,10 +748,12 @@ def delete_storage_containers(
             logger.debug('deleting table: {}'.format(_STORAGE_CONTAINERS[key]))
             table_client.delete_table(_STORAGE_CONTAINERS[key])
         elif key.startswith('blob_'):
-            if (key != 'blob_remotefs' and key != 'blob_monitoring'):
-                logger.debug('deleting container: {}'.format(
-                    _STORAGE_CONTAINERS[key]))
-                blob_client.delete_container(_STORAGE_CONTAINERS[key])
+            if (key == 'blob_remotefs' or key == 'blob_monitoring' or
+                    key == 'blob_federation_jobs'):
+                continue
+            logger.debug('deleting container: {}'.format(
+                _STORAGE_CONTAINERS[key]))
+            blob_client.delete_container(_STORAGE_CONTAINERS[key])
         elif not skip_tables and key.startswith('table_'):
             logger.debug('deleting table: {}'.format(_STORAGE_CONTAINERS[key]))
             table_client.delete_table(_STORAGE_CONTAINERS[key])
@@ -774,13 +836,15 @@ def clear_storage_containers(
     bs = settings.batch_shipyard_settings(config)
     for key in _STORAGE_CONTAINERS:
         if not tables_only and key.startswith('blob_'):
-            if (key != 'blob_remotefs' and key != 'blob_monitoring'):
-                _clear_blobs(blob_client, _STORAGE_CONTAINERS[key])
+            if (key == 'blob_remotefs' or key == 'blob_monitoring' or
+                    key == 'blob_federation_jobs'):
+                continue
+            _clear_blobs(blob_client, _STORAGE_CONTAINERS[key])
         elif key.startswith('table_'):
             # TODO remove in a future release: unused registry table
             if key == 'table_registry':
                 continue
-            if key == 'table_monitoring':
+            if key == 'table_monitoring' or 'table_federation' in key:
                 continue
             try:
                 _clear_table(
@@ -821,7 +885,8 @@ def create_storage_containers(blob_client, table_client, config):
     bs = settings.batch_shipyard_settings(config)
     for key in _STORAGE_CONTAINERS:
         if key.startswith('blob_'):
-            if key == 'blob_remotefs' or key == 'blob_monitoring':
+            if (key == 'blob_remotefs' or key == 'blob_monitoring' or
+                    key == 'blob_federation_jobs'):
                 continue
             logger.info('creating container: {}'.format(
                 _STORAGE_CONTAINERS[key]))
@@ -830,7 +895,7 @@ def create_storage_containers(blob_client, table_client, config):
             # TODO remove in a future release: unused registry table
             if key == 'table_registry':
                 continue
-            if key == 'table_monitoring':
+            if key == 'table_monitoring' or 'table_federation' in key:
                 continue
             if key == 'table_perf' and not bs.store_timing_metrics:
                 continue
@@ -838,49 +903,103 @@ def create_storage_containers(blob_client, table_client, config):
             table_client.create_table(_STORAGE_CONTAINERS[key])
 
 
-def create_storage_containers_nonbatch(blob_client, table_client, kind):
-    # type: (azureblob.BlockBlobService, str) -> None
+def create_storage_containers_nonbatch(
+        blob_client, table_client, queue_client, kind):
+    # type: (azureblob.BlockBlobService, azuretable.TableService,
+    #        azurequeue.QueueService, str) -> None
     """Create storage containers used for monitoring
     :param azure.storage.blob.BlockBlobService blob_client: blob client
     :param azure.cosmosdb.table.TableService table_client: table client
+    :param azure.storage.queue.QueueService queue_service: queue client
     :param str kind: kind, "remotefs" or "monitoring"
     """
-    key = 'blob_{}'.format(kind.lower())
-    contname = _STORAGE_CONTAINERS[key]
-    logger.info('creating container: {}'.format(contname))
-    blob_client.create_container(contname)
-    try:
-        key = 'table_{}'.format(kind.lower())
-        contname = _STORAGE_CONTAINERS[key]
-    except KeyError:
-        pass
+    if kind == 'federation':
+        create_storage_containers_nonbatch(
+            blob_client, table_client, queue_client, 'federation_jobs')
+        create_storage_containers_nonbatch(
+            blob_client, table_client, queue_client, 'federation_pools')
     else:
-        logger.info('creating table: {}'.format(contname))
-        table_client.create_table(contname)
+        if blob_client is not None:
+            try:
+                key = 'blob_{}'.format(kind.lower())
+                contname = _STORAGE_CONTAINERS[key]
+            except KeyError:
+                pass
+            else:
+                logger.info('creating container: {}'.format(contname))
+                blob_client.create_container(contname)
+        if table_client is not None:
+            try:
+                key = 'table_{}'.format(kind.lower())
+                contname = _STORAGE_CONTAINERS[key]
+            except KeyError:
+                pass
+            else:
+                logger.info('creating table: {}'.format(contname))
+                table_client.create_table(contname)
+        if queue_client is not None:
+            try:
+                key = 'queue_{}'.format(kind.lower())
+                contname = _STORAGE_CONTAINERS[key]
+            except KeyError:
+                pass
+            else:
+                logger.info('creating queue: {}'.format(contname))
+                queue_client.create_queue(contname)
 
 
-def delete_storage_containers_nonbatch(blob_client, table_client, kind):
-    # type: (azureblob.BlockBlobService, str) -> None
+def delete_storage_containers_nonbatch(
+        blob_client, table_client, queue_client, kind):
+    # type: (azureblob.BlockBlobService, azuretable.TableService,
+    #        azurequeue.QueueService, str) -> None
     """Delete storage containers used for monitoring
     :param azure.storage.blob.BlockBlobService blob_client: blob client
     :param azure.cosmosdb.table.TableService table_client: table client
+    :param azure.storage.queue.QueueService queue_service: queue client
     :param str kind: kind, "remotefs" or "monitoring"
     """
-    key = 'blob_{}'.format(kind.lower())
-    contname = _STORAGE_CONTAINERS[key]
-    logger.info('deleting container: {}'.format(contname))
-    try:
-        blob_client.delete_container(contname)
-    except azure.common.AzureMissingResourceHttpError:
-        logger.warning('container not found: {}'.format(contname))
-    try:
-        key = 'table_{}'.format(kind.lower())
-        contname = _STORAGE_CONTAINERS[key]
-    except KeyError:
-        pass
+    if kind == 'federation':
+        delete_storage_containers_nonbatch(
+            blob_client, table_client, queue_client, 'federation_jobs')
+        delete_storage_containers_nonbatch(
+            blob_client, table_client, queue_client, 'federation_pools')
     else:
-        logger.debug('deleting table: {}'.format(contname))
-        table_client.delete_table(contname)
+        if blob_client is not None:
+            try:
+                key = 'blob_{}'.format(kind.lower())
+                contname = _STORAGE_CONTAINERS[key]
+            except KeyError:
+                pass
+            else:
+                logger.info('deleting container: {}'.format(contname))
+                try:
+                    blob_client.delete_container(contname)
+                except azure.common.AzureMissingResourceHttpError:
+                    logger.warning('container not found: {}'.format(contname))
+        if table_client is not None:
+            try:
+                key = 'table_{}'.format(kind.lower())
+                contname = _STORAGE_CONTAINERS[key]
+            except KeyError:
+                pass
+            else:
+                logger.debug('deleting table: {}'.format(contname))
+                try:
+                    table_client.delete_table(contname)
+                except azure.common.AzureMissingResourceHttpError:
+                    logger.warning('table not found: {}'.format(contname))
+        if queue_client is not None:
+            try:
+                key = 'queue_{}'.format(kind.lower())
+                contname = _STORAGE_CONTAINERS[key]
+            except KeyError:
+                pass
+            else:
+                logger.debug('deleting queue: {}'.format(contname))
+                try:
+                    queue_client.delete_queue(contname)
+                except azure.common.AzureMissingResourceHttpError:
+                    logger.warning('queue not found: {}'.format(contname))
 
 
 def delete_storage_containers_boot_diagnostics(

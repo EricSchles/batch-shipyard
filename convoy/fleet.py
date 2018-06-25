@@ -47,6 +47,7 @@ from . import autoscale
 from . import batch
 from . import crypto
 from . import data
+from . import federation
 from . import keyvault
 from . import misc
 from . import monitor
@@ -254,6 +255,13 @@ _CONFIGURABLE_MONITORING_FILES = {
     'nginx': _MONITORINGNGINXCONF_FILE,
     'dashboard': _MONITORINGGRAFANADASHBOARD_FILE,
 }
+_FEDERATIONPREP_FILE = (
+    'shipyard_federation_bootstrap.sh',
+    pathlib.Path(_ROOT_PATH, 'scripts/shipyard_federation_bootstrap.sh')
+)
+_ALL_FEDERATION_FILES = [
+    _FEDERATIONPREP_FILE,
+]
 
 
 def initialize_globals(verbose):
@@ -4383,5 +4391,130 @@ def action_monitor_destroy(
     monitor.delete_monitoring_resource(
         resource_client, compute_client, network_client, blob_client,
         table_client, config, delete_virtual_network=delete_virtual_network,
+        delete_resource_group=delete_all_resources,
+        generate_from_prefix=generate_from_prefix, wait=wait)
+
+
+def action_fed_create(
+        auth_client, resource_client, compute_client, network_client,
+        blob_client, table_client, queue_client, config):
+    # type: (azure.mgmt.authorization.AuthorizationManagementClient,
+    #        azure.mgmt.resource.resources.ResourceManagementClient,
+    #        azure.mgmt.compute.ComputeManagementClient,
+    #        azure.mgmt.network.NetworkManagementClient,
+    #        azure.storage.blob.BlockBlobService,
+    #        azure.cosmosdb.table.TableService,
+    #        azure.storage.queue.QueueService, dict) -> None
+    """Action: Fed Create
+    :param azure.mgmt.authorization.AuthorizationManagementClient auth_client:
+        auth client
+    :param azure.mgmt.resource.resources.ResourceManagementClient
+        resource_client: resource client
+    :param azure.mgmt.compute.ComputeManagementClient compute_client:
+        compute client
+    :param azure.mgmt.network.NetworkManagementClient network_client:
+        network client
+    :param azure.storage.blob.BlockBlobService blob_client: blob client
+    :param azure.cosmosdb.table.TableService table_client: table client
+    :param azure.storage.queue.QueueService queue_client: queue client
+    :param dict config: configuration dict
+    """
+    _check_resource_client(resource_client)
+    _check_compute_client(compute_client)
+    _check_network_client(network_client)
+    # ensure aad creds are populated
+    mgmt_aad = settings.credentials_management(config)
+    if (util.is_none_or_empty(mgmt_aad.subscription_id) or
+            util.is_none_or_empty(mgmt_aad.aad.authority_url)):
+        raise ValueError('management aad credentials are invalid')
+    federation.create_federation_proxy(
+        auth_client, resource_client, compute_client, network_client,
+        blob_client, table_client, queue_client, config, _RESOURCES_PATH,
+        _FEDERATIONPREP_FILE, _ALL_FEDERATION_FILES)
+
+
+def action_fed_add(
+        table_client, config, federation_id, batch_service_url, pools):
+    # type: (azure.cosmosdb.table.TableService, dict, str, str,
+    #        List[str]) -> None
+    """Action: Fed Add
+    :param azure.mgmt.compute.ComputeManagementClient compute_client:
+        compute client
+    :param azure.mgmt.network.NetworkManagementClient network_client:
+        network client
+    :param azure.cosmosdb.table.TableService table_client: table client
+    :param dict config: configuration dict
+    :param str federation_id: federation id
+    :param str batch_service_url: Batch service url to use instead
+    :param list pools: list of pool ids to add to federation
+    """
+    if util.is_none_or_empty(pools):
+        logger.error('no pools specified to add to federation')
+        return
+    # ensure that we are operating in AAD mode for batch
+    bc = settings.credentials_batch(config)
+    _check_for_batch_aad(bc, 'add pool(s) to federation')
+    storage.add_pool_to_federation(
+        table_client, config, federation_id, batch_service_url, pools)
+
+
+def action_fed_ssh(
+        compute_client, network_client, config, tty, command):
+    # type: (azure.mgmt.compute.ComputeManagementClient,
+    #        azure.mgmt.network.NetworkManagementClient, dict,
+    #        bool, tuple) -> None
+    """Action: Fed Ssh
+    :param azure.mgmt.compute.ComputeManagementClient compute_client:
+        compute client
+    :param azure.mgmt.network.NetworkManagementClient network_client:
+        network client
+    :param dict config: configuration dict
+    :param bool tty: allocate pseudo-tty
+    :param tuple command: command
+    """
+    _check_compute_client(compute_client)
+    _check_network_client(network_client)
+    federation.ssh_federation_proxy(
+        compute_client, network_client, config, tty, command)
+
+
+def action_fed_destroy(
+        resource_client, compute_client, network_client, blob_client,
+        table_client, queue_client, config, delete_all_resources,
+        delete_virtual_network, generate_from_prefix, wait):
+    # type: (azure.mgmt.resource.resources.ResourceManagementClient,
+    #        azure.mgmt.compute.ComputeManagementClient,
+    #        azure.mgmt.network.NetworkManagementClient,
+    #        azure.storage.blob.BlockBlobService,
+    #        azure.cosmosdb.table.TableService,
+    #        azure.storage.queue.QueueService, dict, bool, bool,
+    #        bool, bool) -> None
+    """Action: Fed Destroy
+    :param azure.mgmt.resource.resources.ResourceManagementClient
+        resource_client: resource client
+    :param azure.mgmt.compute.ComputeManagementClient compute_client:
+        compute client
+    :param azure.mgmt.network.NetworkManagementClient network_client:
+        network client
+    :param azure.storage.blob.BlockBlobService blob_client: blob client
+    :param azure.cosmosdb.table.TableService table_client: table client
+    :param azure.storage.queue.QueueService queue_client: queue client
+    :param dict config: configuration dict
+    :param bool delete_all_resources: delete all resources
+    :param bool delete_virtual_network: delete virtual network
+    :param bool generate_from_prefix: generate resources from hostname prefix
+    :param bool wait: wait for deletion to complete
+    """
+    _check_resource_client(resource_client)
+    _check_compute_client(compute_client)
+    _check_network_client(network_client)
+    if (generate_from_prefix and
+            (delete_all_resources or delete_virtual_network)):
+        raise ValueError(
+            'Cannot specify generate_from_prefix and a delete_* option')
+    federation.delete_federation_proxy(
+        resource_client, compute_client, network_client, blob_client,
+        table_client, queue_client, config,
+        delete_virtual_network=delete_virtual_network,
         delete_resource_group=delete_all_resources,
         generate_from_prefix=generate_from_prefix, wait=wait)

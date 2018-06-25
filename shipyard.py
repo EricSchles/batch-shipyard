@@ -66,11 +66,13 @@ class CliContext(object):
         self.conf_jobs = None
         self.conf_fs = None
         self.conf_monitor = None
+        self.conf_federation = None
         # clients
         self.batch_mgmt_client = None
         self.batch_client = None
         self.blob_client = None
         self.table_client = None
+        self.queue_client = None
         self.keyvault_client = None
         self.auth_client = None
         self.resource_client = None
@@ -150,7 +152,8 @@ class CliContext(object):
         self._init_keyvault_client()
         self._init_config(
             skip_global_config=False, skip_pool_config=True,
-            skip_monitor_config=True, fs_storage=True)
+            skip_monitor_config=True, skip_federation_config=True,
+            fs_storage=True)
         self._ensure_credentials_section('storage')
         _, self.resource_client, self.compute_client, self.network_client, \
             self.storage_mgmt_client, _, _ = \
@@ -158,7 +161,7 @@ class CliContext(object):
         # inject storage account keys if via aad
         convoy.fleet.fetch_storage_account_keys_from_aad(
             self.storage_mgmt_client, self.config, fs_storage=True)
-        self.blob_client, _ = convoy.clients.create_storage_clients()
+        self.blob_client, _, _ = convoy.clients.create_storage_clients()
         self._cleanup_after_initialize()
 
     def initialize_for_monitor(self):
@@ -173,7 +176,8 @@ class CliContext(object):
         self._init_keyvault_client()
         self._init_config(
             skip_global_config=False, skip_pool_config=True,
-            skip_monitor_config=False, fs_storage=True)
+            skip_monitor_config=False, skip_federation_config=True,
+            fs_storage=True)
         self._ensure_credentials_section('storage')
         self._ensure_credentials_section('monitoring')
         self.auth_client, self.resource_client, self.compute_client, \
@@ -182,7 +186,32 @@ class CliContext(object):
         # inject storage account keys if via aad
         convoy.fleet.fetch_storage_account_keys_from_aad(
             self.storage_mgmt_client, self.config, fs_storage=True)
-        self.blob_client, self.table_client = \
+        self.blob_client, self.table_client, _ = \
+            convoy.clients.create_storage_clients()
+        self._cleanup_after_initialize()
+
+    def initialize_for_federation(self):
+        # type: (CliContext) -> None
+        """Initialize context for fed commands
+        :param CliContext self: this
+        """
+        self._read_credentials_config()
+        self._set_global_cli_options()
+        if self.verbose:
+            logger.debug('initializing for fed actions')
+        self._init_keyvault_client()
+        self._init_config(
+            skip_global_config=False, skip_pool_config=True,
+            skip_monitor_config=True, skip_federation_config=False,
+            fs_storage=True)
+        self._ensure_credentials_section('storage')
+        self.auth_client, self.resource_client, self.compute_client, \
+            self.network_client, self.storage_mgmt_client, _, _ = \
+            convoy.clients.create_all_clients(self)
+        # inject storage account keys if via aad
+        convoy.fleet.fetch_storage_account_keys_from_aad(
+            self.storage_mgmt_client, self.config, fs_storage=True)
+        self.blob_client, self.table_client, self.queue_client = \
             convoy.clients.create_storage_clients()
         self._cleanup_after_initialize()
 
@@ -198,7 +227,8 @@ class CliContext(object):
         self._init_keyvault_client()
         self._init_config(
             skip_global_config=True, skip_pool_config=True,
-            skip_monitor_config=True, fs_storage=False)
+            skip_monitor_config=True, skip_federation_config=True,
+            fs_storage=False)
         # do not perform keyvault credentials section check as all
         # options can be specified off the cli, validity of the keyvault
         # client will be checked later
@@ -216,7 +246,8 @@ class CliContext(object):
         self._init_keyvault_client()
         self._init_config(
             skip_global_config=False, skip_pool_config=False,
-            skip_monitor_config=True, fs_storage=False)
+            skip_monitor_config=True, skip_federation_config=True,
+            fs_storage=False)
         self._ensure_credentials_section('storage')
         self._ensure_credentials_section('batch')
         _, self.resource_client, self.compute_client, self.network_client, \
@@ -226,7 +257,7 @@ class CliContext(object):
         # inject storage account keys if via aad
         convoy.fleet.fetch_storage_account_keys_from_aad(
             self.storage_mgmt_client, self.config, fs_storage=False)
-        self.blob_client, self.table_client = \
+        self.blob_client, self.table_client, _ = \
             convoy.clients.create_storage_clients()
         self._cleanup_after_initialize()
 
@@ -242,14 +273,15 @@ class CliContext(object):
         self._init_keyvault_client()
         self._init_config(
             skip_global_config=False, skip_pool_config=False,
-            skip_monitor_config=True, fs_storage=False)
+            skip_monitor_config=True, skip_federation_config=True,
+            fs_storage=False)
         self._ensure_credentials_section('storage')
         # inject storage account keys if via aad
         _, _, _, _, self.storage_mgmt_client, _, _ = \
             convoy.clients.create_all_clients(self)
         convoy.fleet.fetch_storage_account_keys_from_aad(
             self.storage_mgmt_client, self.config, fs_storage=False)
-        self.blob_client, self.table_client = \
+        self.blob_client, self.table_client, _ = \
             convoy.clients.create_storage_clients()
         self._cleanup_after_initialize()
 
@@ -280,6 +312,7 @@ class CliContext(object):
         del self.conf_pool
         del self.conf_jobs
         del self.conf_monitor
+        del self.conf_federation
         # free cli options
         del self.verbose
         del self.yes
@@ -352,13 +385,15 @@ class CliContext(object):
 
     def _init_config(
             self, skip_global_config=False, skip_pool_config=False,
-            skip_monitor_config=True, fs_storage=False):
-        # type: (CliContext, bool, bool, bool, bool) -> None
+            skip_monitor_config=True, skip_federation_config=True,
+            fs_storage=False):
+        # type: (CliContext, bool, bool, bool, bool, bool) -> None
         """Initializes configuration of the context
         :param CliContext self: this
         :param bool skip_global_config: skip global config
         :param bool skip_pool_config: skip pool config
         :param bool skip_monitor_config: skip monitoring config
+        :param bool skip_federation_config: skip federation config
         :param bool fs_storage: adjust storage settings for fs
         """
         # reset config
@@ -408,6 +443,16 @@ class CliContext(object):
                 self.conf_monitor)
             convoy.validator.validate_config(
                 convoy.validator.ConfigType.Monitor, self.conf_monitor)
+        # set/validate federation config
+        if not skip_federation_config:
+            self.conf_federation = self._form_conf_path(
+                self.conf_federation, 'federation')
+            if self.conf_federation is None:
+                raise ValueError('federation conf file was not specified')
+            self.conf_federation = CliContext.ensure_pathlib_conf(
+                self.conf_federation)
+            convoy.validator.validate_config(
+                convoy.validator.ConfigType.Federation, self.conf_federation)
         # fetch credentials from keyvault, if conf file is missing
         kvcreds = None
         if self.conf_credentials is None or not self.conf_credentials.exists():
@@ -458,6 +503,8 @@ class CliContext(object):
                     self._read_config_file(self.conf_jobs)
         if not skip_monitor_config:
             self._read_config_file(self.conf_monitor)
+        if not skip_federation_config:
+            self._read_config_file(self.conf_federation)
         # adjust settings
         convoy.fleet.initialize_globals(convoy.settings.verbose(self.config))
         if not skip_global_config:
@@ -768,6 +815,19 @@ def _jobs_option(f):
         callback=callback)(f)
 
 
+def federation_option(f):
+    def callback(ctx, param, value):
+        clictx = ctx.ensure_object(CliContext)
+        clictx.conf_federation = value
+        return value
+    return click.option(
+        '--federation',
+        expose_value=False,
+        envvar='SHIPYARD_FEDERATION_CONF',
+        help='Federation config file',
+        callback=callback)(f)
+
+
 def fs_option(f):
     def callback(ctx, param, value):
         clictx = ctx.ensure_object(CliContext)
@@ -854,6 +914,12 @@ def fs_cluster_options(f):
 
 def monitor_options(f):
     f = monitor_option(f)
+    f = _azure_subscription_id_option(f)
+    return f
+
+
+def federation_options(f):
+    f = federation_option(f)
     f = _azure_subscription_id_option(f)
     return f
 
@@ -2347,6 +2413,92 @@ def monitor_destroy(
         ctx.resource_client, ctx.compute_client, ctx.network_client,
         ctx.blob_client, ctx.table_client, ctx.config, delete_resource_group,
         delete_virtual_network, generate_from_prefix, not no_wait)
+
+
+@cli.group()
+@pass_cli_context
+def fed(ctx):
+    """Federation actions"""
+    pass
+
+
+@fed.command('create')
+@common_options
+@federation_options
+@keyvault_options
+@aad_options
+@pass_cli_context
+def fed_create(ctx):
+    """Create a federation proxy"""
+    ctx.initialize_for_federation()
+    convoy.fleet.action_fed_create(
+        ctx.auth_client, ctx.resource_client, ctx.compute_client,
+        ctx.network_client, ctx.blob_client, ctx.table_client,
+        ctx.queue_client, ctx.config)
+
+
+@fed.command('add')
+@click.argument('federation-id')
+@click.option(
+    '--batch-service-url',
+    help='Associate specified pools with batch service url')
+@click.option(
+    '--poolid', multiple=True, help='Add pool to federation')
+@common_options
+@federation_options
+@keyvault_options
+@aad_options
+@pass_cli_context
+def fed_add(ctx, federation_id, batch_service_url, poolid):
+    """Add a pool to a federation"""
+    ctx.initialize_for_federation()
+    convoy.fleet.action_fed_add(
+        ctx.table_client, ctx.config, federation_id, batch_service_url, poolid)
+
+
+@fed.command('ssh')
+@click.option(
+    '--tty', is_flag=True, help='Allocate a pseudo-tty')
+@common_options
+@federation_options
+@click.argument('command', nargs=-1)
+@keyvault_options
+@aad_options
+@pass_cli_context
+def fed_ssh(ctx, tty, command):
+    """Interactively login via SSH to federation proxy virtual
+    machine in Azure"""
+    ctx.initialize_for_federation()
+    convoy.fleet.action_fed_ssh(
+        ctx.compute_client, ctx.network_client, ctx.config, tty, command)
+
+
+@fed.command('destroy')
+@click.option(
+    '--delete-resource-group', is_flag=True,
+    help='Delete all resources in the federation resource group')
+@click.option(
+    '--delete-virtual-network', is_flag=True, help='Delete virtual network')
+@click.option(
+    '--generate-from-prefix', is_flag=True,
+    help='Generate resources to delete from federation hostname prefix')
+@click.option(
+    '--no-wait', is_flag=True, help='Do not wait for deletion to complete')
+@common_options
+@federation_options
+@keyvault_options
+@aad_options
+@pass_cli_context
+def fed_destroy(
+        ctx, delete_resource_group, delete_virtual_network,
+        generate_from_prefix, no_wait):
+    """Destroy a federation proxy"""
+    ctx.initialize_for_federation()
+    convoy.fleet.action_fed_destroy(
+        ctx.resource_client, ctx.compute_client, ctx.network_client,
+        ctx.blob_client, ctx.table_client, ctx.queue_client, ctx.config,
+        delete_resource_group, delete_virtual_network, generate_from_prefix,
+        not no_wait)
 
 
 if __name__ == '__main__':
