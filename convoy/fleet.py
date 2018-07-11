@@ -1440,7 +1440,7 @@ def _construct_pool_object(
             )
         )
     # upload resource files
-    sas_urls = storage.upload_resource_files(blob_client, config, _rflist)
+    sas_urls = storage.upload_resource_files(blob_client, _rflist)
     del _rflist
     # remove temporary az mount files created
     if azureblob_vd:
@@ -1875,8 +1875,7 @@ def _setup_glusterfs(
             appcmd.append('gluster volume set {} {}'.format(
                 settings.get_gluster_default_volume_name(), vo))
     # upload script
-    sas_urls = storage.upload_resource_files(
-        blob_client, config, [shell_script])
+    sas_urls = storage.upload_resource_files(blob_client, [shell_script])
     # get pool current dedicated
     pool = batch_client.pool.get(pool_id)
     batchtask = batchmodels.TaskAddParameter(
@@ -3691,7 +3690,7 @@ def action_jobs_add(
     # add jobs
     is_windows = settings.is_windows_pool(config)
     batch.add_jobs(
-        batch_client, blob_client, keyvault_client, config, autopool,
+        batch_client, blob_client, None, keyvault_client, config, autopool,
         _IMAGE_BLOCK_FILE,
         _BLOBXFER_WINDOWS_FILE if is_windows else _BLOBXFER_FILE,
         recreate, tail)
@@ -4433,31 +4432,6 @@ def action_fed_create(
         _FEDERATIONPREP_FILE, _ALL_FEDERATION_FILES)
 
 
-def action_fed_add(
-        table_client, config, federation_id, batch_service_url, pools):
-    # type: (azure.cosmosdb.table.TableService, dict, str, str,
-    #        List[str]) -> None
-    """Action: Fed Add
-    :param azure.mgmt.compute.ComputeManagementClient compute_client:
-        compute client
-    :param azure.mgmt.network.NetworkManagementClient network_client:
-        network client
-    :param azure.cosmosdb.table.TableService table_client: table client
-    :param dict config: configuration dict
-    :param str federation_id: federation id
-    :param str batch_service_url: Batch service url to use instead
-    :param list pools: list of pool ids to add to federation
-    """
-    if util.is_none_or_empty(pools):
-        logger.error('no pools specified to add to federation')
-        return
-    # ensure that we are operating in AAD mode for batch
-    bc = settings.credentials_batch(config)
-    _check_for_batch_aad(bc, 'add pool(s) to federation')
-    storage.add_pool_to_federation(
-        table_client, config, federation_id, batch_service_url, pools)
-
-
 def action_fed_ssh(
         compute_client, network_client, config, tty, command):
     # type: (azure.mgmt.compute.ComputeManagementClient,
@@ -4518,3 +4492,124 @@ def action_fed_destroy(
         delete_virtual_network=delete_virtual_network,
         delete_resource_group=delete_all_resources,
         generate_from_prefix=generate_from_prefix, wait=wait)
+
+
+def action_fed_id_create(
+        blob_client, table_client, queue_client, config, federation_id):
+    # type: (azure.storage.blob.BlockBlobService,
+    #        azure.cosmosdb.table.TableService,
+    #        azure.storage.queue.QueueService, dict, str) -> None
+    """Action: Fed Id Create
+    :param azure.storage.blob.BlockBlobService blob_client: blob client
+    :param azure.cosmosdb.table.TableService table_client: table client
+    :param azure.storage.queue.QueueService queue_client: queue client
+    :param dict config: configuration dict
+    :param str federation_id: federation id
+    """
+    if util.is_none_or_empty(federation_id):
+        raise ValueError('federation id is invalid')
+    logger.info('creating federation id: {}'.format(federation_id))
+    storage.create_federation_id(
+        blob_client, table_client, queue_client, federation_id.lower())
+
+
+def action_fed_id_add_pool(
+        table_client, config, federation_id, batch_service_url, pools):
+    # type: (azure.cosmosdb.table.TableService, dict, str, str,
+    #        List[str]) -> None
+    """Action: Fed Id Add
+    :param azure.mgmt.compute.ComputeManagementClient compute_client:
+        compute client
+    :param azure.mgmt.network.NetworkManagementClient network_client:
+        network client
+    :param azure.cosmosdb.table.TableService table_client: table client
+    :param dict config: configuration dict
+    :param str federation_id: federation id
+    :param str batch_service_url: Batch service url to use instead
+    :param list pools: list of pool ids to add to federation
+    """
+    if util.is_none_or_empty(federation_id):
+        raise ValueError('federation id is invalid')
+    if util.is_none_or_empty(pools):
+        logger.error('no pools specified to add to federation')
+        return
+    # ensure that we are operating in AAD mode for batch
+    bc = settings.credentials_batch(config)
+    _check_for_batch_aad(bc, 'add pool(s) to federation')
+    storage.add_pool_to_federation(
+        table_client, config, federation_id.lower(), batch_service_url, pools)
+
+
+def action_fed_id_remove_pool(
+        table_client, config, federation_id, all, batch_service_url, pools):
+    # type: (azure.cosmosdb.table.TableService, dict, str, bool, str,
+    #        List[str]) -> None
+    """Action: Fed Id Remove
+    :param azure.mgmt.compute.ComputeManagementClient compute_client:
+        compute client
+    :param azure.mgmt.network.NetworkManagementClient network_client:
+        network client
+    :param azure.cosmosdb.table.TableService table_client: table client
+    :param dict config: configuration dict
+    :param str federation_id: federation id
+    :param bool all: all pools
+    :param str batch_service_url: Batch service url to use instead
+    :param list pools: list of pool ids to add to federation
+    """
+    if util.is_none_or_empty(federation_id):
+        raise ValueError('federation id is invalid')
+    if util.is_none_or_empty(pools) and not all:
+        logger.error('no pools specified to remove from federation')
+        return
+    elif util.is_not_empty(pools) and all:
+        raise ValueError('cannot specify both --all and --poolid')
+    storage.remove_pool_from_federation(
+        table_client, config, federation_id.lower(), all, batch_service_url,
+        pools)
+
+
+def action_fed_id_destroy(
+        blob_client, table_client, queue_client, config, federation_id):
+    # type: (azure.storage.blob.BlockBlobService,
+    #        azure.cosmosdb.table.TableService,
+    #        azure.storage.queue.QueueService, dict, str) -> None
+    """Action: Fed Id Destroy
+    :param azure.storage.blob.BlockBlobService blob_client: blob client
+    :param azure.cosmosdb.table.TableService table_client: table client
+    :param azure.storage.queue.QueueService queue_client: queue client
+    :param dict config: configuration dict
+    :param str federation_id: federation id
+    """
+    if util.is_none_or_empty(federation_id):
+        raise ValueError('federation id is invalid')
+    if not util.confirm_action(
+            config,
+            msg='destroy federation id {}, all queued jobs for the '
+            'federation will be deleted'.format(federation_id)):
+        return
+    logger.info('destroying federation id: {}'.format(federation_id))
+    storage.destroy_federation_id(
+        blob_client, table_client, queue_client, federation_id.lower())
+
+
+def action_fed_jobs_add(
+        batch_client, keyvault_client, blob_client, table_client,
+        queue_client, config, federation_id):
+    # type: (azure.storage.blob.BlockBlobService,
+    #        azure.cosmosdb.table.TableService,
+    #        azure.storage.queue.QueueService, dict, str) -> None
+    """Action: Fed Jobs Add
+    :param azure.storage.blob.BlockBlobService blob_client: blob client
+    :param azure.cosmosdb.table.TableService table_client: table client
+    :param azure.storage.queue.QueueService queue_client: queue client
+    :param dict config: configuration dict
+    :param str federation_id: federation id
+    """
+    if util.is_none_or_empty(federation_id):
+        raise ValueError('federation id is invalid')
+    is_windows = settings.is_windows_pool(config)
+    batch.add_jobs(
+        batch_client, blob_client, queue_client, keyvault_client, config,
+        None, _IMAGE_BLOCK_FILE,
+        _BLOBXFER_WINDOWS_FILE if is_windows else _BLOBXFER_FILE,
+        recreate=False, tail=None, federation_id=federation_id)

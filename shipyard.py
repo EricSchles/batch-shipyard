@@ -190,10 +190,11 @@ class CliContext(object):
             convoy.clients.create_storage_clients()
         self._cleanup_after_initialize()
 
-    def initialize_for_federation(self):
-        # type: (CliContext) -> None
+    def initialize_for_federation(self, init_batch=False):
+        # type: (CliContext, bool) -> None
         """Initialize context for fed commands
         :param CliContext self: this
+        :param bool init_batch: initialize batch
         """
         self._read_credentials_config()
         self._set_global_cli_options()
@@ -201,13 +202,14 @@ class CliContext(object):
             logger.debug('initializing for fed actions')
         self._init_keyvault_client()
         self._init_config(
-            skip_global_config=False, skip_pool_config=True,
+            skip_global_config=False, skip_pool_config=not init_batch,
             skip_monitor_config=True, skip_federation_config=False,
             fs_storage=True)
         self._ensure_credentials_section('storage')
         self.auth_client, self.resource_client, self.compute_client, \
-            self.network_client, self.storage_mgmt_client, _, _ = \
-            convoy.clients.create_all_clients(self)
+            self.network_client, self.storage_mgmt_client, _, \
+            self.batch_client = convoy.clients.create_all_clients(
+                self, batch_clients=init_batch)
         # inject storage account keys if via aad
         convoy.fleet.fetch_storage_account_keys_from_aad(
             self.storage_mgmt_client, self.config, fs_storage=True)
@@ -2437,25 +2439,6 @@ def fed_create(ctx):
         ctx.queue_client, ctx.config)
 
 
-@fed.command('add')
-@click.argument('federation-id')
-@click.option(
-    '--batch-service-url',
-    help='Associate specified pools with batch service url')
-@click.option(
-    '--poolid', multiple=True, help='Add pool to federation')
-@common_options
-@federation_options
-@keyvault_options
-@aad_options
-@pass_cli_context
-def fed_add(ctx, federation_id, batch_service_url, poolid):
-    """Add a pool to a federation"""
-    ctx.initialize_for_federation()
-    convoy.fleet.action_fed_add(
-        ctx.table_client, ctx.config, federation_id, batch_service_url, poolid)
-
-
 @fed.command('ssh')
 @click.option(
     '--tty', is_flag=True, help='Allocate a pseudo-tty')
@@ -2499,6 +2482,106 @@ def fed_destroy(
         ctx.blob_client, ctx.table_client, ctx.queue_client, ctx.config,
         delete_resource_group, delete_virtual_network, generate_from_prefix,
         not no_wait)
+
+
+@fed.group()
+@pass_cli_context
+def id(ctx):
+    """Federation ID actions"""
+    pass
+
+
+@id.command('create')
+@click.argument('federation-id')
+@common_options
+@federation_options
+@keyvault_options
+@aad_options
+@pass_cli_context
+def fed_id_create(ctx, federation_id):
+    """Create a federation id"""
+    ctx.initialize_for_federation()
+    convoy.fleet.action_fed_id_create(
+        ctx.blob_client, ctx.table_client, ctx.queue_client, ctx.config,
+        federation_id)
+
+
+@id.command('add')
+@click.argument('federation-id')
+@click.option(
+    '--batch-service-url',
+    help='Associate specified pools with batch service url')
+@click.option(
+    '--poolid', multiple=True, help='Add pool to federation')
+@common_options
+@federation_options
+@keyvault_options
+@aad_options
+@pass_cli_context
+def fed_id_add(ctx, federation_id, batch_service_url, poolid):
+    """Add a pool to a federation"""
+    ctx.initialize_for_federation()
+    convoy.fleet.action_fed_id_add_pool(
+        ctx.table_client, ctx.config, federation_id, batch_service_url, poolid)
+
+
+@id.command('remove')
+@click.argument('federation-id')
+@click.option(
+    '--all', is_flag=True, help='Remove all pools from federation')
+@click.option(
+    '--batch-service-url',
+    help='Associate specified pools with batch service url')
+@click.option(
+    '--poolid', multiple=True, help='Remove pool from federation')
+@common_options
+@federation_options
+@keyvault_options
+@aad_options
+@pass_cli_context
+def fed_id_remove(ctx, federation_id, all, batch_service_url, poolid):
+    """Remove a pool from a federation"""
+    ctx.initialize_for_federation()
+    convoy.fleet.action_fed_id_remove_pool(
+        ctx.table_client, ctx.config, federation_id, all, batch_service_url,
+        poolid)
+
+
+@id.command('destroy')
+@click.argument('federation-id')
+@common_options
+@federation_options
+@keyvault_options
+@aad_options
+@pass_cli_context
+def fed_id_destroy(ctx, federation_id):
+    """Destroy a federation id"""
+    ctx.initialize_for_federation()
+    convoy.fleet.action_fed_id_destroy(
+        ctx.blob_client, ctx.table_client, ctx.queue_client, ctx.config,
+        federation_id)
+
+
+@fed.group()
+@pass_cli_context
+def jobs(ctx):
+    """Federation jobs actions"""
+    pass
+
+
+@jobs.command('add')
+@click.argument('federation-id')
+@common_options
+@federation_options
+@keyvault_options
+@aad_options
+@pass_cli_context
+def fed_jobs_add(ctx, federation_id):
+    """Add jobs to a federation"""
+    ctx.initialize_for_federation(init_batch=True)
+    convoy.fleet.action_fed_jobs_add(
+        ctx.batch_client, ctx.keyvault_client, ctx.blob_client,
+        ctx.table_client, ctx.queue_client, ctx.config, federation_id)
 
 
 if __name__ == '__main__':

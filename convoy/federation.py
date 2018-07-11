@@ -92,7 +92,7 @@ def _create_virtual_machine_extension(
             storage.get_storageaccount(),
             rg if util.is_not_empty(rg) else '',
             # TODO  fix this
-            storage.get_storage_table_federation_pools(),
+            ''
         ),
         v=' -v {}'.format(__version__),
     )
@@ -180,7 +180,7 @@ def create_federation_proxy(
         resource_client, fs.resource_group, fs.location)
     # create storage container
     storage.create_storage_containers_nonbatch(
-        blob_client, table_client, None, 'federation')
+        blob_client, table_client, queue_client, 'federation')
     # upload scripts to blob storage for customscript vm extension
     blob_urls = storage.upload_for_nonbatch(
         blob_client, federation_files, 'federation')
@@ -451,9 +451,9 @@ def delete_federation_proxy(
     if settings.verbose(config):
         logger.debug('deleting the following resources:{}{}'.format(
             os.linesep, json.dumps(resources, sort_keys=True, indent=4)))
-    # delete storage container
+    # delete storage containers, only delete global blob container
     storage.delete_storage_containers_nonbatch(
-        blob_client, table_client, None, 'federation')
+        blob_client, None, None, 'federation')
     # create async op holder
     async_ops = {}
     # delete vms

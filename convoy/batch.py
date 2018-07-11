@@ -47,6 +47,7 @@ import ssl
 import sys
 import tempfile
 import time
+import uuid
 # non-stdlib imports
 import azure.batch.models as batchmodels
 import azure.mgmt.batch.models as mgmtbatchmodels
@@ -4184,7 +4185,7 @@ def _construct_task(
             f.close()
             if not native and not is_singularity:
                 sas_urls = storage.upload_resource_files(
-                    blob_client, config, [(envfileloc, fname)])
+                    blob_client, [(envfileloc, fname)])
         finally:
             os.unlink(fname)
             del f
@@ -4461,15 +4462,18 @@ def _construct_task(
 
 
 def add_jobs(
-        batch_client, blob_client, keyvault_client, config, autopool, jpfile,
-        bxfile, recreate=False, tail=None):
+        batch_client, blob_client, queue_client, keyvault_client, config,
+        autopool, jpfile, bxfile, recreate=False, tail=None,
+        federation_id=None):
     # type: (batch.BatchServiceClient, azureblob.BlockBlobService,
-    #        azure.keyvault.KeyVaultClient, dict,
-    #        batchmodels.PoolSpecification, tuple, tuple, bool, str) -> None
+    #        azurequeue.QueueService, azure.keyvault.KeyVaultClient, dict,
+    #        batchmodels.PoolSpecification, tuple, tuple, bool, str,
+    #        str) -> None
     """Add jobs
     :param batch_client: The batch client to use.
     :type batch_client: `azure.batch.batch_service_client.BatchServiceClient`
     :param azure.storage.blob.BlockBlobService blob_client: blob client
+    :param azure.storage.queue.QueueService queue_client: queue_client
     :param azure.keyvault.KeyVaultClient keyvault_client: keyvault client
     :param dict config: configuration dict
     :param batchmodels.PoolSpecification autopool: auto pool specification
@@ -4477,7 +4481,20 @@ def add_jobs(
     :param tuple bxfile: blobxfer file
     :param bool recreate: recreate job if completed
     :param str tail: tail specified file of last job/task added
+    :param str federation_id: federation id
     """
+    # check option compatibility
+    if util.is_not_empty(federation_id):
+        if autopool is not None:
+            raise RuntimeError(
+                'cannot create an auto-pool job within a federation')
+        if recreate:
+            raise RuntimeError(
+                'cannot recreate a job within a federation')
+        if tail is not None:
+            raise RuntimeError(
+                'cannot tail task output for the specified file within '
+                'a federation')
     # get the pool inter-node comm setting
     bs = settings.batch_shipyard_settings(config)
     pool = settings.pool_settings(config)
@@ -4490,7 +4507,7 @@ def add_jobs(
     except batchmodels.batch_error.BatchErrorException as ex:
         if 'The specified pool does not exist' in ex.message.value:
             cloud_pool = None
-            if autopool is None:
+            if autopool is None and util.is_none_or_empty(federation_id):
                 logger.error('{} pool does not exist'.format(pool.id))
                 if not util.confirm_action(
                         config,
@@ -4506,7 +4523,6 @@ def add_jobs(
     singularity_images = settings.global_resources_singularity_images(config)
     lastjob = None
     lasttaskid = None
-    jobschedule = None
     tasksadded = False
     for jobspec in settings.job_specifications(config):
         job_id = settings.job_id(jobspec)
@@ -4517,6 +4533,7 @@ def add_jobs(
         # 3. if tasks have dependencies, set it if so
         # 4. if there are multi-instance tasks
         auto_complete = settings.job_auto_complete(jobspec)
+        jobschedule = None
         multi_instance = False
         mi_docker_container_name = None
         reserved_task_id = None
@@ -4830,8 +4847,6 @@ def add_jobs(
             )
             del jscs
             del jscmdline
-        else:
-            jobschedule = None
         del recurrence
         # create job
         if jobschedule is None:
@@ -4851,9 +4866,15 @@ def add_jobs(
                 ],
                 priority=settings.job_priority(jobspec),
             )
-            logger.info('Adding job {} to pool {}'.format(job_id, pool.id))
             try:
-                batch_client.job.add(job)
+                if util.is_none_or_empty(federation_id):
+                    logger.info('Adding job {} to pool {}'.format(
+                        job_id, pool.id))
+                    batch_client.job.add(job)
+                else:
+                    logger.info(
+                        'deferring adding job {} for federation {}'.format(
+                            job_id, federation_id))
                 if settings.verbose(config) and jptask is not None:
                     logger.debug('Job prep command: {}'.format(
                         jptask.command_line))
@@ -4947,43 +4968,104 @@ def add_jobs(
             taskmaploc = '{}jsrf-{}/{}'.format(
                 bs.storage_entity_prefix, job_id, _TASKMAP_PICKLE_FILE)
             # pickle and upload task map
-            f = tempfile.NamedTemporaryFile(mode='wb', delete=False)
-            fname = f.name
-            try:
-                with open(fname, 'wb') as f:
-                    pickle.dump(task_map, f, protocol=pickle.HIGHEST_PROTOCOL)
-                f.close()
-                sas_urls = storage.upload_resource_files(
-                    blob_client, config, [(taskmaploc, fname)])
-            finally:
-                os.unlink(fname)
-                del f
-                del fname
-            if len(sas_urls) != 1:
-                raise RuntimeError('unexpected number of sas urls')
+            sas_url = pickle_and_upload(blob_client, task_map, taskmaploc)
+            del taskmaploc
             # attach as resource file to jm task
             jobschedule.job_specification.job_manager_task.resource_files.\
                 append(
                     batchmodels.ResourceFile(
                         file_path=_TASKMAP_PICKLE_FILE,
-                        blob_source=next(iter(sas_urls.values())),
+                        blob_source=sas_url,
                         file_mode='0640',
                     )
                 )
             # submit job schedule
-            logger.info('Adding jobschedule {} to pool {}'.format(
-                job_id, pool.id))
-            batch_client.job_schedule.add(jobschedule)
+            if util.is_none_or_empty(federation_id):
+                logger.info('Adding jobschedule {} to pool {}'.format(
+                    job_id, pool.id))
+                batch_client.job_schedule.add(jobschedule)
+            else:
+                logger.debug(
+                    'submitting job schedule {} for federation {}'.format(
+                        jobschedule.id, federation_id))
+                # encapsulate job schedule and task map sas pickle in json
+                info = {
+                    'version': 1,
+                    'federation_id': federation_id,
+                    'job_schedule': {
+                        'id': jobschedule.id,
+                        'data': jobschedule,
+                    },
+                    'task_sas': sas_url,
+                }
+                # pickle json and upload
+                jsloc = 'jobschedules/{}-{}.pickle'.format(
+                    jobschedule.id, uuid.uuid4())
+                sas_url = pickle_and_upload(
+                    blob_client, info, jsloc, federation_id=federation_id)
+                del jsloc
+                # construct queue message
+                info = {
+                    'version': 1,
+                    'federation_id': federation_id,
+                    'action': {
+                        'method': 'add',
+                        'kind': 'job_schedule',
+                    },
+                    'blob_data': sas_url,
+                }
+                # enqueue action to global queue
+                logger.debug('enqueuing action to federation {}'.format(
+                    federation_id))
+                storage.add_job_to_federation(
+                    queue_client, federation_id, info)
+                del info
         else:
             # add task collection to job
-            _add_task_collection(batch_client, job_id, task_map)
-            # patch job if job autocompletion is needed
-            if auto_complete:
-                batch_client.job.patch(
-                    job_id=job_id,
-                    job_patch_parameter=batchmodels.JobPatchParameter(
-                        on_all_tasks_complete=batchmodels.
-                        OnAllTasksComplete.terminate_job))
+            if util.is_none_or_empty(federation_id):
+                _add_task_collection(batch_client, job_id, task_map)
+                # patch job if job autocompletion is needed
+                if auto_complete:
+                    batch_client.job.patch(
+                        job_id=job_id,
+                        job_patch_parameter=batchmodels.JobPatchParameter(
+                            on_all_tasks_complete=batchmodels.
+                            OnAllTasksComplete.terminate_job))
+            else:
+                logger.debug('submitting job {} for federation {}'.format(
+                    job_id, federation_id))
+                # encapsulate job, auto_complete and task map in json
+                info = {
+                    'version': 1,
+                    'federation_id': federation_id,
+                    'job': {
+                        'id': job_id,
+                        'data': job,
+                        'auto_complete': auto_complete,
+                    },
+                    'task_map': task_map,
+                }
+                # pickle json and upload
+                jloc = 'jobs/{}-{}.pickle'.format(job_id, uuid.uuid4())
+                sas_url = pickle_and_upload(
+                    blob_client, info, jloc, federation_id=federation_id)
+                del jloc
+                # construct queue message
+                info = {
+                    'version': 1,
+                    'federation_id': federation_id,
+                    'action': {
+                        'method': 'add',
+                        'kind': 'job',
+                    },
+                    'blob_data': sas_url,
+                }
+                # enqueue action to global queue
+                logger.debug('enqueuing action to federation {}'.format(
+                    federation_id))
+                storage.add_job_to_federation(
+                    queue_client, federation_id, info)
+                del info
         tasksadded = True
     # tail file if specified
     if tail:
@@ -4995,3 +5077,38 @@ def add_jobs(
             stream_file_and_wait_for_task(
                 batch_client, config, filespec='{},{},{}'.format(
                     lastjob, lasttaskid, tail), disk=False)
+
+
+def pickle_and_upload(blob_client, data, rpath, federation_id=None):
+    # type: (azureblob.BlockBlobService, dict, str, str) -> str
+    """Pickle and upload data to a given remote path
+    :param azure.storage.blob.BlockBlobService blob_client: blob client
+    :param dict data: data to pickle
+    :param str rpath: remote path
+    :param str federation_id: federation id
+    :rtype: str
+    :return: sas url of uploaded pickle
+    """
+    f = tempfile.NamedTemporaryFile(mode='wb', delete=False)
+    fname = f.name
+    try:
+        with open(fname, 'wb') as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        f.close()
+        if util.is_none_or_empty(federation_id):
+            sas_urls = storage.upload_resource_files(
+                blob_client, [(rpath, fname)])
+        else:
+            sas_urls = storage.upload_job_for_federation(
+                blob_client, federation_id, [(rpath, fname)])
+        if len(sas_urls) != 1:
+            raise RuntimeError(
+                'unexpected number of sas urls for pickled upload')
+        return next(iter(sas_urls.values()))
+    finally:
+        try:
+            os.unlink(fname)
+        except OSError:
+            pass
+        del f
+        del fname
