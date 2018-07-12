@@ -56,21 +56,21 @@ fi
 
 # globals
 aad_cloud=
-fqdn=
+prefix=
+refresh_interval=30
 storage_account=
-table_name=
 storage_rg=
 shipyardversion=
 
 # process command line options
-while getopts "h?a:d:s:v:" opt; do
+while getopts "h?a:r:s:v:" opt; do
     case "$opt" in
         h|\?)
             echo "shipyard_federation_bootstrap.sh parameters"
             echo ""
             echo "-a [aad cloud type] AAD cloud type for MSI"
-            echo "-d [fqdn] fully qualified domain name"
-            echo "-s [storage account:resource group:table name] storage config"
+            echo "-r [interval] federation refresh interval"
+            echo "-s [storage account:resource group:prefix] storage config"
             echo "-v [version] batch-shipyard version"
             echo ""
             exit 1
@@ -78,14 +78,14 @@ while getopts "h?a:d:s:v:" opt; do
         a)
             aad_cloud=${OPTARG,,}
             ;;
-        d)
-            fqdn=${OPTARG,,}
+        r)
+            refresh_interval=${OPTARG}
             ;;
         s)
             IFS=':' read -ra ss <<< "${OPTARG,,}"
             storage_account=${ss[0]}
             storage_rg=${ss[1]}
-            table_name=${ss[2]}
+            prefix=${ss[2]}
             ;;
         v)
             shipyardversion=$OPTARG
@@ -224,9 +224,12 @@ cat > ${SHIPYARD_CONF_FILE} << EOF
     "storage": {
         "account": "$storage_account",
         "resource_group": "$storage_rg",
-        "table_name": "$table_name"
+        "entity_prefix": "$prefix"
     },
-    "batch_shipyard_version": "$shipyardversion"
+    "batch_shipyard": {
+        "version": "$shipyardversion"
+    },
+    "federation_refresh_interval": $refresh_interval
 }
 EOF
     log INFO "Batch Shipyard federation config created"
@@ -282,20 +285,11 @@ install_docker_host_engine() {
 
 setup_docker_compose_systemd() {
     # create systemd area for docker compose
-    mkdir -p /etc/docker/compose/batch-shipyard-monitoring
+    mkdir -p /etc/docker/compose/batch-shipyard-federation
     chmod 644 docker-compose.yml
-    cp docker-compose.yml /etc/docker/compose/batch-shipyard-monitoring/
-    # substitute LE/fqdn vars
-    if [ "$letsencrypt" -eq 1 ]; then
-        sed -i "s/{GF_SERVER_DOMAIN}/- GF_SERVER_DOMAIN=$fqdn/g" /etc/docker/compose/batch-shipyard-monitoring/docker-compose.yml
-        if [ "$letsencrypt_staging" -eq 1 ]; then
-            sed -i "s/{LE_CERT_DIR}/archive/g" /etc/docker/compose/batch-shipyard-monitoring/docker-compose.yml
-        else
-            sed -i "s/{LE_CERT_DIR}/live/g" /etc/docker/compose/batch-shipyard-monitoring/docker-compose.yml
-        fi
-    fi
+    cp docker-compose.yml /etc/docker/compose/batch-shipyard-federation/
     # substitute batch shipyard version
-    sed -i "s/{BATCH_SHIPYARD_VERSION}/$shipyardversion/g" /etc/docker/compose/batch-shipyard-monitoring/docker-compose.yml
+    sed -i "s/{BATCH_SHIPYARD_VERSION}/$shipyardversion/g" /etc/docker/compose/batch-shipyard-federation/docker-compose.yml
     # create systemd unit file
 cat << EOF > /etc/systemd/system/docker-compose@.service
 [Unit]
@@ -327,184 +321,14 @@ EOF
     log INFO "systemd unit files for docker compose installed"
 }
 
-run_nginx_acme_challenge() {
-    if [ "$letsencrypt" -eq 0 ]; then
-        log WARNING "Let's encrypt disabled, skipping nginx setup"
-    fi
-    log INFO "Configuring letsencrypt"
-    mkdir -p ${LETSENCRYPT_VAR_DIR}/html
-    mkdir -p ${NGINX_VAR_DIR}
-cat << EOF > ${NGINX_VAR_DIR}/nginx.conf
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${fqdn};
-
-    location ~ /.well-known/acme-challenge {
-        allow all;
-        root /usr/share/nginx/html;
-    }
-
-    root /usr/share/nginx/html;
-    index index.html;
-}
-EOF
-    # create dhparam
-    mkdir -p ${NGINX_VAR_DIR}/dhparam
-    openssl dhparam -out ${NGINX_VAR_DIR}/dhparam/dhparam-2048.pem 2048
-    # run nginx detached for letsencrypt ACME challenge
-    docker run -d --rm \
-        -v ${NGINX_VAR_DIR}/nginx.conf:/etc/nginx/conf.d/default.conf \
-        -v ${LETSENCRYPT_VAR_DIR}/html:/usr/share/nginx/html \
-        -p 80:80 \
-        --name nginx \
-        nginx:mainline-alpine
-    log INFO "Nginx waiting for ACME challenge"
-}
-
-acquire_letsencrypt_certs() {
-    if [ "$letsencrypt" -eq 0 ]; then
-        log WARNING "Let's encrypt disabled, skipping cert acquisition"
-    fi
-    # execute letsencrypt test/staging
-    mkdir -p ${LETSENCRYPT_VAR_DIR}/etc
-    mkdir -p ${LETSENCRYPT_VAR_DIR}/var/lib
-    mkdir -p ${LETSENCRYPT_VAR_DIR}/var/log
-    log DEBUG "Testing stage ACME challenge"
-    docker run --rm \
-        -v ${LETSENCRYPT_VAR_DIR}/etc:/etc/letsencrypt \
-        -v ${LETSENCRYPT_VAR_DIR}/var/lib:/var/lib/letsencrypt \
-        -v ${LETSENCRYPT_VAR_DIR}/html:/data/letsencrypt \
-        -v ${LETSENCRYPT_VAR_DIR}/var/log:/var/log/letsencrypt \
-        certbot/certbot certonly \
-        --webroot --webroot-path=/data/letsencrypt -d "${fqdn}" \
-        --register-unsafely-without-email --agree-tos --staging
-    # execute letsencrypt prod
-    if [ "$letsencrypt_staging" -eq 0 ]; then
-        rm -rf ${LETSENCRYPT_VAR_DIR}
-        mkdir -p ${LETSENCRYPT_VAR_DIR}/etc
-        mkdir -p ${LETSENCRYPT_VAR_DIR}/var/lib
-        mkdir -p ${LETSENCRYPT_VAR_DIR}/var/log
-        log DEBUG "Using prod ACME challenge"
-        docker run --rm \
-            -v ${LETSENCRYPT_VAR_DIR}/etc:/etc/letsencrypt \
-            -v ${LETSENCRYPT_VAR_DIR}/var/lib:/var/lib/letsencrypt \
-            -v ${LETSENCRYPT_VAR_DIR}/html:/data/letsencrypt \
-            -v ${LETSENCRYPT_VAR_DIR}/var/log:/var/log/letsencrypt \
-            certbot/certbot certonly \
-            --webroot --webroot-path=/data/letsencrypt -d "${fqdn}" \
-            --register-unsafely-without-email --no-eff-email --agree-tos
-    fi
-    log INFO "Letsencrypt certs acquired"
-}
-
-add_cert_renewal_crontab() {
-    if [ "$letsencrypt" -eq 0 ]; then
-        log WARNING "Let's encrypt disabled, skipping cert auto-renew"
-    fi
-    local staging
-    if [ "$letsencrypt_staging" -eq 1 ]; then
-        staging="--staging"
-    fi
-cat << EOF > /etc/cron.daily/certbot-renew
-#!/bin/sh
-
-set -e
-
-docker run --rm \
-    -v ${LETSENCRYPT_VAR_DIR}/etc:/etc/letsencrypt \
-    -v ${LETSENCRYPT_VAR_DIR}/var/lib:/var/lib/letsencrypt \
-    -v ${LETSENCRYPT_VAR_DIR}/html:/data/letsencrypt \
-    -v ${LETSENCRYPT_VAR_DIR}/var/log:/var/log/letsencrypt \
-    certbot/certbot renew $staging
-EOF
-    chmod 755 /etc/cron.daily/certbot-renew
-    log INFO "Cert renewal add to crontab"
-}
-
-configure_nginx_with_certs() {
-    if [ "$letsencrypt" -eq 0 ]; then
-        log WARNING "Let's encrypt disabled, skipping nginx cert setup"
-    fi
-    # kill existing nginx container
-    docker kill nginx
-    # configure nginx with real certs
-    chmod 644 nginx.conf
-    cp nginx.conf ${NGINX_VAR_DIR}/
-    # substitute fqdn
-    sed -i "s/{FQDN}/$fqdn/g" ${NGINX_VAR_DIR}/nginx.conf
-    # substitute le cert suffix
-    if [ "$letsencrypt_staging" -eq 1 ]; then
-        sed -i "s/{LE_CERT_SUFFIX}/1/g" ${NGINX_VAR_DIR}/nginx.conf
-    else
-        sed -i "s/{LE_CERT_SUFFIX}//g" ${NGINX_VAR_DIR}/nginx.conf
-    fi
-    # substitute resolver
-    resolver=$(grep '^nameserver ' /etc/resolv.conf | cut -d' ' -f 2)
-    sed -i "s/{RESOLVER}/$resolver/g" ${NGINX_VAR_DIR}/nginx.conf
-    log INFO "Nginx configured with letsencrypt certs"
-}
-
-# configure prometheus/grafana
-configure_prometheus_grafana() {
-    mkdir -p ${PROMETHEUS_VAR_DIR}
-    chmod 644 prometheus.yml
-    cp prometheus.yml ${PROMETHEUS_VAR_DIR}
-    mkdir -p ${GRAFANA_PROVISIONING_DIR}/datasources
-    mkdir -p ${GRAFANA_PROVISIONING_DIR}/dashboards
-    chmod 644 batch_shipyard_dashboard.json
-    cp batch_shipyard_dashboard.json ${GRAFANA_PROVISIONING_DIR}/dashboards
-    # download any additional dashboards
-    if [ -f additional_dashboards.txt ]; then
-        readarray -t dbarr <<< "$(<additional_dashboards.txt)"
-        for dbpair in "${dbarr[@]}"; do
-            IFS=',' read -ra dbent <<< "${dbpair}"
-            download_file_as "${dbent[1]}" "${GRAFANA_PROVISIONING_DIR}/dashboards/${dbent[0]}"
-            chmod 644 "${GRAFANA_PROVISIONING_DIR}/dashboards/${dbent[0]}"
-        done
-    fi
-cat << EOF > ${GRAFANA_PROVISIONING_DIR}/datasources/prometheus.yml
-apiVersion: 1
-
-deleteDatasources:
-  - name: Prometheus
-    orgId: 1
-
-datasources:
-  - name: Prometheus
-    type: prometheus
-    access: proxy
-    orgId: 1
-    url: http://prometheus:9090
-    basicAuth: false
-    withCredentials: false
-    isDefault: true
-    version: 1
-    editable: true
-EOF
-cat << EOF > ${GRAFANA_PROVISIONING_DIR}/dashboards/dashboard.yml
-apiVersion: 1
-
-providers:
-  - name: Prometheus
-    orgId: 1
-    folder: ''
-    type: file
-    disableDeletion: false
-    editable: true
-    options:
-      path: /etc/grafana/provisioning/dashboards
-EOF
-}
-
 log INFO "Bootstrap start"
 echo "Configuration:"
 echo "--------------"
 echo "OS Distribution: $DISTRIB_ID $DISTRIB_RELEASE"
 echo "Batch Shipyard version: $shipyardversion"
 echo "AAD cloud: $aad_cloud"
-echo "FQDN: $fqdn"
-echo "Storage: $storage_account:$storage_rg:$table_name"
+echo "Federation refresh interval: $refresh_interval"
+echo "Storage: $storage_account:$storage_rg:$prefix"
 echo ""
 
 # check sdb1 mount
@@ -522,23 +346,10 @@ install_docker_host_engine
 # setup docker compose on startup
 #setup_docker_compose_systemd
 
-# configure nginx for ACME challenge
-#run_nginx_acme_challenge
-
-# get let's encrypt certs and re-configure nginx
-#acquire_letsencrypt_certs
-#configure_nginx_with_certs
-
-# add certbot renewal to crontab
-#add_cert_renewal_crontab
-
-# configure prometheus and grafana
-#configure_prometheus_grafana
-
 # start and enable services
 #systemctl daemon-reload
-#systemctl start docker-compose@batch-shipyard-monitoring
-#systemctl enable docker-compose@batch-shipyard-monitoring
-#systemctl --no-pager status docker-compose@batch-shipyard-monitoring
+#systemctl start docker-compose@batch-shipyard-federation
+#systemctl enable docker-compose@batch-shipyard-federation
+#systemctl --no-pager status docker-compose@batch-shipyard-federation
 
 log INFO "Bootstrap completed"

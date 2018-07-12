@@ -79,7 +79,7 @@ while getopts "h?a:d:flp:s:v:" opt; do
             echo "-d [fqdn] fully qualified domain name"
             echo "-f use staging LE ACME CSR (fake)"
             echo "-l enable lets encrypt"
-            echo "-p [polling interval] pollint interval"
+            echo "-p [polling interval] polling interval"
             echo "-s [storage account:table name:resource group] monitoring table"
             echo "-v [version] batch-shipyard version"
             echo ""

@@ -611,13 +611,22 @@ def remove_resources_from_monitoring(
                         sc_id))
 
 
+def hash_string(strdata):
+    """Hash a string
+    :param str strdata: string data to hash
+    :rtype: str
+    :return: hexdigest
+    """
+    return hashlib.sha1(strdata.encode('utf8')).hexdigest()
+
+
 def hash_federation_id(federation_id):
     """Hash a federation id
     :param str federation_id: federation id
     :rtype: str
     :return: hashed federation id
     """
-    fedhash = hashlib.sha1(federation_id.encode('utf8')).hexdigest()
+    fedhash = hash_string(federation_id)
     logger.debug('federation id {} -> {}'.format(federation_id, fedhash))
     return fedhash
 
@@ -709,10 +718,13 @@ def add_pool_to_federation(
             batch_service_url)
     fedhash = hash_federation_id(federation_id)
     for poolid in pools:
+        rk = hash_string('{}${}'.format(batch_service_url, poolid))
         entity = {
-            'PartitionKey': federation_id,
-            'RowKey': '{}${}'.format(account, poolid),
-            'FederationHashSHA1': fedhash,
+            'PartitionKey': fedhash,
+            'RowKey': rk,
+            'FederationId': federation_id,
+            'BatchAccount': account,
+            'PoolId': poolid,
             'Location': location,
             'BatchServiceUrl': batch_service_url,
         }
@@ -743,13 +755,14 @@ def remove_pool_from_federation(
     :param str batch_service_url: batch service url to associate
     :param list pools: pools to monitor
     """
+    fedhash = hash_federation_id(federation_id)
     if all:
         if util.confirm_action(
                 config, 'remove all pools from federation {}'.format(
                     federation_id)):
             _clear_table(
                 table_client, _STORAGE_CONTAINERS['table_federation_global'],
-                config, pool_id=None, pk=federation_id)
+                config, pool_id=None, pk=fedhash)
         return
     if util.is_not_empty(batch_service_url):
         account, _ = settings.parse_batch_service_url(batch_service_url)
@@ -763,10 +776,11 @@ def remove_pool_from_federation(
                     poolid, federation_id)):
             continue
         try:
+            rk = hash_string('{}${}'.format(batch_service_url, poolid))
             table_client.delete_entity(
                 _STORAGE_CONTAINERS['table_federation_global'],
-                partition_key=federation_id,
-                row_key='{}${}'.format(account, poolid)
+                partition_key=fedhash,
+                row_key=rk,
             )
         except azure.common.AzureMissingResourceHttpError:
             logger.error('pool {} is not in federation {}'.format(

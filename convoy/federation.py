@@ -77,6 +77,7 @@ def _create_virtual_machine_extension(
     :rtype: msrestazure.azure_operation.AzureOperationPoller
     :return: msrestazure.azure_operation.AzureOperationPoller
     """
+    bs = settings.batch_shipyard_settings(config)
     # construct vm extensions
     vm_ext_name = settings.generate_virtual_machine_extension_name(
         vm_resource, offset)
@@ -84,15 +85,14 @@ def _create_virtual_machine_extension(
     ssel = settings.batch_shipyard_settings(config).storage_account_settings
     rg = settings.credentials_storage(config, ssel).resource_group
     # construct bootstrap command
-    cmd = './{bsf}{a}{d}{s}{v}'.format(
+    cmd = './{bsf}{a}{r}{s}{v}'.format(
         bsf=bootstrap_file[0],
         a=' -a {}'.format(settings.determine_cloud_type_from_aad(config)),
-        d=' -d {}'.format(fqdn) if util.is_not_empty(fqdn) else '',
+        r='', # TODO refresh interval
         s=' -s {}:{}:{}'.format(
             storage.get_storageaccount(),
             rg if util.is_not_empty(rg) else '',
-            # TODO  fix this
-            ''
+            bs.storage_entity_prefix
         ),
         v=' -v {}'.format(__version__),
     )
