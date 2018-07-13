@@ -898,7 +898,7 @@ def upload_job_for_federation(blob_client, federation_id, files):
             contname, file[0],
             blob_client.generate_blob_shared_access_signature(
                 contname, file[0],
-                permission=azureblob.BlobPermissions.READ,
+                permission=azureblob.BlobPermissions(read=True, delete=True),
                 expiry=datetime.datetime.utcnow() +
                 datetime.timedelta(days=_DEFAULT_SAS_EXPIRY_DAYS)
             )

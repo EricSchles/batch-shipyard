@@ -4920,7 +4920,6 @@ def add_jobs(
                                      on_task_failure.value))
                 else:
                     raise
-        del multi_instance
         del mi_docker_container_name
         # get base env vars from job
         job_env_vars = settings.job_environment_variables(jobspec)
@@ -4990,23 +4989,26 @@ def add_jobs(
                         jobschedule.id, federation_id))
                 # encapsulate job schedule and task map sas pickle in json
                 info = {
-                    'version': 1,
-                    'federation_id': federation_id,
+                    'version': '1',
                     'job_schedule': {
                         'id': jobschedule.id,
                         'data': jobschedule,
+                        'constraints': {
+                            'has_multi_instance': multi_instance,
+                            'native': native,
+                            'windows': is_windows,
+                        },
                     },
-                    'task_sas': sas_url,
                 }
                 # pickle json and upload
-                jsloc = 'jobschedules/{}-{}.pickle'.format(
+                jsloc = 'jobschedules/{}/{}.pickle'.format(
                     jobschedule.id, uuid.uuid4())
                 sas_url = pickle_and_upload(
                     blob_client, info, jsloc, federation_id=federation_id)
                 del jsloc
                 # construct queue message
                 info = {
-                    'version': 1,
+                    'version': '1',
                     'federation_id': federation_id,
                     'action': {
                         'method': 'add',
@@ -5036,23 +5038,27 @@ def add_jobs(
                     job_id, federation_id))
                 # encapsulate job, auto_complete and task map in json
                 info = {
-                    'version': 1,
-                    'federation_id': federation_id,
+                    'version': '1',
                     'job': {
                         'id': job_id,
                         'data': job,
-                        'auto_complete': auto_complete,
+                        'constraints': {
+                            'auto_complete': auto_complete,
+                            'has_multi_instance': multi_instance,
+                            'native': native,
+                            'windows': is_windows,
+                        },
                     },
                     'task_map': task_map,
                 }
                 # pickle json and upload
-                jloc = 'jobs/{}-{}.pickle'.format(job_id, uuid.uuid4())
+                jloc = 'jobs/{}/{}.pickle'.format(job_id, uuid.uuid4())
                 sas_url = pickle_and_upload(
                     blob_client, info, jloc, federation_id=federation_id)
                 del jloc
                 # construct queue message
                 info = {
-                    'version': 1,
+                    'version': '1',
                     'federation_id': federation_id,
                     'action': {
                         'method': 'add',

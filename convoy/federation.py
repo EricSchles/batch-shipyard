@@ -88,7 +88,7 @@ def _create_virtual_machine_extension(
     cmd = './{bsf}{a}{r}{s}{v}'.format(
         bsf=bootstrap_file[0],
         a=' -a {}'.format(settings.determine_cloud_type_from_aad(config)),
-        r='', # TODO refresh interval
+        r=' -r 15', # TODO refresh interval config
         s=' -s {}:{}:{}'.format(
             storage.get_storageaccount(),
             rg if util.is_not_empty(rg) else '',
@@ -273,7 +273,7 @@ def create_federation_proxy(
     sub_scope = '/subscriptions/{}/'.format(sub_id)
     cont_role = None
     for role in auth_client.role_definitions.list(
-            sub_scope, filter='roleName eq \'Reader\''):
+            sub_scope, filter='roleName eq \'Contributor\''):
         cont_role = role.id
         break
     if cont_role is None:
