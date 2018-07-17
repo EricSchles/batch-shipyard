@@ -28,12 +28,14 @@
 import argparse
 import asyncio
 import concurrent.futures
+import datetime
 import hashlib
 import json
 import logging
 import logging.handlers
 import multiprocessing
 import pickle
+import random
 import threading
 from typing import (
     Any,
@@ -53,6 +55,7 @@ import azure.mgmt.resource
 import azure.mgmt.storage
 import azure.storage.blob
 import azure.storage.queue
+import dateutil.tz
 import msrestazure.azure_active_directory
 import msrestazure.azure_cloud
 
@@ -74,9 +77,17 @@ def _setup_logger() -> None:
     logger.addHandler(handler)
 
 
+def max_workers_for_executor(iterable: Any) -> int:
+    """Get max number of workers for executor given an iterable
+    :param iterable: an iterable
+    :return: number of workers for executor
+    """
+    return min((len(iterable), _MAX_EXECUTOR_WORKERS))
+
+
 def is_none_or_empty(obj: Any) -> bool:
     """Determine if object is None or empty
-    :type obj: object
+    :param obj: object
     :return: if object is None or empty
     """
     return obj is None or len(obj) == 0
@@ -84,10 +95,22 @@ def is_none_or_empty(obj: Any) -> bool:
 
 def is_not_empty(obj: Any) -> bool:
     """Determine if object is not None and is length is > 0
-    :type obj: object
+    :param obj: object
     :return: if object is not None and length is > 0
     """
     return obj is not None and len(obj) > 0
+
+
+def datetime_utcnow(as_string: bool=False) -> datetime.datetime:
+    """Returns a datetime now with UTC timezone
+    :param as_string: return as ISO8601 extended string
+    :return: datetime object representing now with UTC timezone
+    """
+    dt = datetime.datetime.now(dateutil.tz.tzutc())
+    if as_string:
+        return dt.strftime('%Y%m%dT%H%M%S.%f')[:-3] + 'Z'
+    else:
+        return dt
 
 
 def hash_string(strdata: str) -> str:
@@ -218,10 +241,12 @@ class ServiceProxy():
         self.queue_prefix = '{}fed'.format(prefix)
         self.table_name_global = '{}fedglobal'.format(prefix)
         self.table_name_jobs = '{}fedjobs'.format(prefix)
+        self.blob_container_name_global = '{}fedglobal'.format(prefix)
         # create credentials
         self.creds = Credentials(config)
         # create clients
         self.compute_client = self._create_compute_client()
+        self.blob_client = self._create_blob_client()
         self.table_client = self._create_table_client()
         self.queue_client = self._create_queue_client()
         logger.debug('created storage clients for storage account {}'.format(
@@ -259,6 +284,16 @@ class ServiceProxy():
             endpoint_suffix=self.creds.storage_account_ep,
         )
         return client
+
+    def _create_blob_client(self) -> azure.storage.blob.BlockBlobService:
+        """Create a blob client for the given storage account
+        :return: block blob client
+        """
+        return azure.storage.blob.BlockBlobService(
+            account_name=self.creds.storage_account,
+            account_key=self.creds.storage_account_key,
+            endpoint_suffix=self.creds.storage_account_ep,
+        )
 
     def _create_compute_client(
             self
@@ -387,119 +422,314 @@ class BatchServiceHandler():
             batch_account: str,
             service_url: str,
             job_id: str,
-    ) -> bool:
+    ) -> batchmodels.CloudJob:
         client = self.service_proxy.batch_client(batch_account, service_url)
-        client.job.get(job_id)
+        return client.job.get(job_id)
 
     def add_job(
             self,
             batch_account: str,
             service_url: str,
             job: batchmodels.JobAddParameter,
-    ) -> bool:
+    ) -> None:
         client = self.service_proxy.batch_client(batch_account, service_url)
         client.job.add(job)
 
-
-def _submit_task_sub_collection(
-        batch_client, job_id, start, end, slice, all_tasks, task_map):
-    # type: (batch.BatchServiceClient, str, int, int, int, list, dict) -> None
-    """Submits a sub-collection of tasks, do not call directly
-    :param batch_client: The batch client to use.
-    :type batch_client: `azure.batch.batch_service_client.BatchServiceClient`
-    :param str job_id: job to add to
-    :param int start: start offset, includsive
-    :param int end: end offset, exclusive
-    :param int slice: slice width
-    :param list all_tasks: list of all task ids
-    :param dict task_map: task collection map to add
-    """
-    initial_slice = slice
-    while True:
-        chunk_end = start + slice
-        if chunk_end > end:
-            chunk_end = end
-        chunk = all_tasks[start:chunk_end]
-        logger.debug('submitting {} tasks ({} -> {}) to job {}'.format(
-            len(chunk), start, chunk_end - 1, job_id))
+    async def terminate_job(
+            self,
+            batch_account: str,
+            service_url: str,
+            job_id: str,
+            wait: bool=False,
+    ) -> None:
+        logger.debug('terminating job {} (account={} service_url={})'.format(
+            job_id, batch_account, service_url))
+        client = self.service_proxy.batch_client(batch_account, service_url)
         try:
-            results = batch_client.task.add_collection(job_id, chunk)
-        except batchmodels.BatchErrorException as e:
-            if e.error.code == 'RequestBodyTooLarge':
-                # collection contents are too large, reduce and retry
-                if slice == 1:
-                    raise
-                slice = slice >> 1
-                if slice < 1:
-                    slice = 1
-                logger.error(
-                    ('task collection slice was too big, retrying with '
-                     'slice={}').format(slice))
-                continue
-        else:
-            # go through result and retry just failed tasks
+            client.job.terminate(job_id)
+        except batchmodels.batch_error.BatchErrorException as exc:
+            if ('completed state' in exc.message.value or
+                    'marked for deletion' in exc.message.value):
+                return
+        # wait for job to terminate
+        if wait:
             while True:
-                retry = []
-                for result in results.value:
-                    if result.status == batchmodels.TaskAddStatus.client_error:
-                        de = [
-                            '{}: {}'.format(x.key, x.value)
-                            for x in result.error.values
-                        ]
-                        logger.error(
-                            ('skipping retry of adding task {} as it '
-                             'returned a client error (code={} message={} {}) '
-                             'for job {}').format(
-                                 result.task_id, result.error.code,
-                                 result.error.message, ' '.join(de), job_id))
-                    elif (result.status ==
-                          batchmodels.TaskAddStatus.server_error):
-                        retry.append(task_map[result.task_id])
-                if len(retry) > 0:
-                    logger.debug('retrying adding {} tasks to job {}'.format(
-                        len(retry), job_id))
-                    results = batch_client.task.add_collection(job_id, retry)
-                else:
-                    break
-        if chunk_end == end:
-            break
-        start = chunk_end
-        slice = initial_slice
+                try:
+                    _job = client.job.get(job_id)
+                    if _job.state == batchmodels.JobState.completed:
+                        break
+                except batchmodels.batch_error.BatchErrorException as exc:
+                    if 'does not exist' in exc.message.value:
+                        break
+                    else:
+                        raise
+                await asyncio.sleep(1)
 
+    async def delete_job(
+            self,
+            batch_account: str,
+            service_url: str,
+            job_id: str,
+            wait: bool=False,
+    ) -> None:
+        logger.debug('deleting job {} (account={} service_url={})'.format(
+            job_id, batch_account, service_url))
+        client = self.service_proxy.batch_client(batch_account, service_url)
+        try:
+            client.job.delete(job_id)
+        except batchmodels.batch_error.BatchErrorException as exc:
+            if ('does not exist' in exc.message.value or
+                    'marked for deletion' in exc.message.value):
+                return
+        # wait for job to delete
+        if wait:
+            while True:
+                try:
+                    client.job.get(job_id)
+                except batchmodels.batch_error.BatchErrorException as exc:
+                    if 'does not exist' in exc.message.value:
+                        break
+                    else:
+                        raise
+                await asyncio.sleep(1)
 
-def _add_task_collection(batch_client, job_id, task_map):
-    # type: (batch.BatchServiceClient, str, dict) -> None
-    """Add a collection of tasks to a job
-    :param batch_client: The batch client to use.
-    :type batch_client: `azure.batch.batch_service_client.BatchServiceClient`
-    :param str job_id: job to add to
-    :param dict task_map: task collection map to add
-    """
-    all_tasks = list(task_map.values())
-    slice = 100  # can only submit up to 100 tasks at a time
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=_MAX_EXECUTOR_WORKERS) as executor:
-        for start in range(0, len(all_tasks), slice):
-            end = start + slice
-            if end > len(all_tasks):
-                end = len(all_tasks)
-            executor.submit(
-                _submit_task_sub_collection, batch_client, job_id, start, end,
-                end - start, all_tasks, task_map)
-    logger.info('submitted all {} tasks to job {}'.format(
-        len(task_map), job_id))
+    def _format_generic_task_id(
+            self, prefix: str, padding: int, tasknum: int) -> str:
+        """Format a generic task id from a task number
+        :param prefix: prefix
+        :param padding: zfill task number
+        :param tasknum: task number
+        :return: generic task id
+        """
+        return '{}{}'.format(prefix, str(tasknum).zfill(padding))
 
+    def regenerate_next_generic_task_id(
+            self,
+            batch_account: str,
+            service_url: str,
+            job_id: str,
+            naming: Dict[str, Any],
+            current_task_id: str,
+            last_task_id: Optional[str]=None,
+            tasklist: Optional[List[str]]=None,
+            is_merge_task: Optional[bool]=False
+    ) -> Tuple[List[str], str]:
+        """Regenerate the next generic task id
+        :param batch_account: batch account
+        :param service_url: service url
+        :param job_id: job id
+        :param naming: naming convention
+        :param current_task_id: current task id
+        :param tasklist: list of committed and uncommitted tasks in job
+        :param is_merge_task: is merge task
+        :return: (list of task ids for job, next generic docker task id)
+        """
+        # get prefix and padding settings
+        prefix = naming['prefix']
+        if is_merge_task:
+            prefix = 'merge-{}'.format(prefix)
+        if not current_task_id.startswith(prefix):
+            return tasklist, current_task_id
+        padding = naming['padding']
+        delimiter = prefix if is_not_empty(prefix) else ' '
+        client = self.service_proxy.batch_client(batch_account, service_url)
+        # get filtered, sorted list of generic docker task ids
+        try:
+            if tasklist is None:
+                tasklist = client.task.list(
+                    job_id,
+                    task_list_options=batchmodels.TaskListOptions(
+                        filter='startswith(id, \'{}\')'.format(prefix)
+                        if is_not_empty(prefix) else None,
+                        select='id'))
+                tasklist = list(tasklist)
+            tasknum = sorted(
+                [int(x.id.split(delimiter)[-1]) for x in tasklist])[-1] + 1
+        except (batchmodels.batch_error.BatchErrorException, IndexError,
+                TypeError):
+            tasknum = 0
+        id = self._format_generic_task_id(prefix, padding, tasknum)
+        while id in tasklist:
+            try:
+                if (last_task_id is not None and
+                        last_task_id.startswith(prefix)):
+                    tasknum = int(last_task_id.split(delimiter)[-1])
+                    last_task_id = None
+            except Exception:
+                last_task_id = None
+            tasknum += 1
+            id = self._format_generic_task_id(prefix, padding, tasknum)
+        return tasklist, id
 
+    def _submit_task_sub_collection(
+            self,
+            client: azure.batch.BatchServiceClient,
+            job_id: str,
+            start: int,
+            end: int,
+            slice: int,
+            all_tasks: List[str],
+            task_map: Dict[str, batchmodels.TaskAddParameter]
+    ) -> None:
+        """Submits a sub-collection of tasks, do not call directly
+        :param client: batch client
+        :param job_id: job to add to
+        :param start: start offset, includsive
+        :param end: end offset, exclusive
+        :param slice: slice width
+        :param all_tasks: list of all task ids
+        :param task_map: task collection map to add
+        """
+        initial_slice = slice
+        while True:
+            chunk_end = start + slice
+            if chunk_end > end:
+                chunk_end = end
+            chunk = all_tasks[start:chunk_end]
+            logger.debug('submitting {} tasks ({} -> {}) to job {}'.format(
+                len(chunk), start, chunk_end - 1, job_id))
+            try:
+                results = client.task.add_collection(job_id, chunk)
+            except batchmodels.BatchErrorException as e:
+                if e.error.code == 'RequestBodyTooLarge':
+                    # collection contents are too large, reduce and retry
+                    if slice == 1:
+                        raise
+                    slice = slice >> 1
+                    if slice < 1:
+                        slice = 1
+                    logger.error(
+                        ('task collection slice was too big, retrying with '
+                         'slice={}').format(slice))
+                    continue
+            else:
+                # go through result and retry just failed tasks
+                while True:
+                    retry = []
+                    for result in results.value:
+                        if (result.status ==
+                                batchmodels.TaskAddStatus.client_error):
+                            de = [
+                                '{}: {}'.format(x.key, x.value)
+                                for x in result.error.values
+                            ]
+                            logger.error(
+                                ('skipping retry of adding task {} as it '
+                                 'returned a client error (code={} '
+                                 'message={} {}) for job {}').format(
+                                     result.task_id, result.error.code,
+                                     result.error.message, ' '.join(de),
+                                     job_id))
+                        elif (result.status ==
+                              batchmodels.TaskAddStatus.server_error):
+                            retry.append(task_map[result.task_id])
+                    if len(retry) > 0:
+                        logger.debug(
+                            'retrying adding {} tasks to job {}'.format(
+                                len(retry), job_id))
+                        results = client.task.add_collection(job_id, retry)
+                    else:
+                        break
+            if chunk_end == end:
+                break
+            start = chunk_end
+            slice = initial_slice
+
+    def add_task_collection(
+            self,
+            batch_account: str,
+            service_url: str,
+            job_id: str,
+            task_map: Dict[str, batchmodels.TaskAddParameter]
+    ) -> None:
+        """Add a collection of tasks to a job
+        :param batch_account: batch account
+        :param service_url: service url
+        :param job_id: job to add to
+        :param task_map: task collection map to add
+        """
+        client = self.service_proxy.batch_client(batch_account, service_url)
+        all_tasks = list(task_map.values())
+        slice = 100  # can only submit up to 100 tasks at a time
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=_MAX_EXECUTOR_WORKERS) as executor:
+            for start in range(0, len(all_tasks), slice):
+                end = start + slice
+                if end > len(all_tasks):
+                    end = len(all_tasks)
+                executor.submit(
+                    self._submit_task_sub_collection, client, job_id, start,
+                    end, end - start, all_tasks, task_map)
+        logger.info('submitted all {} tasks to job {}'.format(
+            len(task_map), job_id))
+
+    def set_auto_complete_on_job(
+            self,
+            batch_account: str,
+            service_url: str,
+            job_id: str
+    ) -> None:
+        client = self.service_proxy.batch_client(batch_account, service_url)
+        client.job.patch(
+            job_id=job_id,
+            job_patch_parameter=batchmodels.JobPatchParameter(
+                on_all_tasks_complete=batchmodels.
+                OnAllTasksComplete.terminate_job
+            ),
+        )
+        logger.debug('set auto-completion for job {}'.format(job_id))
 
 
 class FederationDataHandler():
+    _GLOBAL_LOCK_BLOB = 'global.lock'
     _ALL_FEDERATIONS_PK = '!!FEDERATIONS'
+    _FEDERATION_ACTIONS_PREFIX_PK = '!!ACTIONS'
 
     def __init__(self, service_proxy: ServiceProxy) -> None:
         """Ctor for Federation data handler
         :param service_proxy: ServiceProxy
         """
         self.service_proxy = service_proxy
+        self.lease_id = None
+
+    @property
+    def has_global_lock(self) -> bool:
+        return self.lease_id is not None
+
+    def lease_global_lock(
+        self,
+        loop: asyncio.BaseEventLoop,
+    ) -> None:
+        try:
+            if self.lease_id is None:
+                logger.debug('acquiring blob lease on {}'.format(
+                    self._GLOBAL_LOCK_BLOB))
+                self.lease_id = \
+                    self.service_proxy.blob_client.acquire_blob_lease(
+                        self.service_proxy.blob_container_name_global,
+                        self._GLOBAL_LOCK_BLOB, lease_duration=15)
+                logger.debug('blob lease acquired on {}'.format(
+                    self._GLOBAL_LOCK_BLOB))
+            else:
+                self.lease_id = \
+                    self.service_proxy.blob_client.renew_blob_lease(
+                        self.service_proxy.blob_container_name_global,
+                        self._GLOBAL_LOCK_BLOB, self.lease_id)
+        except Exception:
+            self.lease_id = None
+        if self.lease_id is None:
+            logger.error('could not acquire/renew lease on {}'.format(
+                self._GLOBAL_LOCK_BLOB))
+        loop.call_later(5, self.lease_global_lock, loop)
+
+    def release_global_lock(self) -> None:
+        if self.lease_id is not None:
+            try:
+                self.service_proxy.blob_client.release_blob_lease(
+                    self.service_proxy.blob_container_name_global,
+                    self._GLOBAL_LOCK_BLOB, self.lease_id)
+            except azure.common.AzureConflictHttpError:
+                self.lease_id = None
 
     def get_all_federations(self) -> List[azure.cosmosdb.table.Entity]:
         """Get all federations"""
@@ -518,6 +748,71 @@ class FederationDataHandler():
             self.service_proxy.table_name_global,
             filter='PartitionKey eq \'{}\''.format(fedhash))
 
+    def get_sequence_entity_for_job(
+            self,
+            fedhash: str,
+            job_id: str
+    ) -> azure.cosmosdb.table.Entity:
+        return self.service_proxy.table_client.get_entity(
+            self.service_proxy.table_name_jobs,
+            '{}${}'.format(self._FEDERATION_ACTIONS_PREFIX_PK, fedhash),
+            job_id)
+
+    def generate_pk_rk_for_job_location_entity(
+            self,
+            fedhash: str,
+            job_id: str,
+            pool: 'FederationPool',
+    ) -> Tuple[str, str]:
+        pk = '{}${}'.format(fedhash, job_id)
+        rk = hash_string('{}${}'.format(pool.service_url, pool.pool_id))
+        return pk, rk
+
+    def get_location_entity_for_job(
+            self,
+            fedhash: str,
+            job_id: str,
+            pool: 'FederationPool',
+    ) -> Optional[azure.cosmosdb.table.Entity]:
+        pk, rk = self.generate_pk_rk_for_job_location_entity(
+            fedhash, job_id, pool)
+        try:
+            return self.service_proxy.table_client.get_entity(
+                self.service_proxy.table_name_jobs, pk, rk)
+        except azure.common.AzureMissingResourceHttpError:
+            return None
+
+    def upsert_location_entity_for_job(
+            self,
+            entity: Dict[str, Any],
+    ) -> None:
+        self.service_proxy.table_client.insert_or_replace_entity(
+            self.service_proxy.table_name_jobs, entity)
+
+    def delete_location_entity_for_job(
+            self,
+            entity: Dict[str, Any],
+    ) -> None:
+        try:
+            self.service_proxy.table_client.delete_entity(
+                self.service_proxy.table_name_jobs, entity['PartitionKey'],
+                entity['RowKey'])
+        except azure.common.AzureMissingResourceHttpError:
+            pass
+
+    def get_all_location_entities_for_job(
+            self,
+            fedhash: str,
+            job_id: str,
+    ) -> Optional[List[azure.cosmosdb.table.Entity]]:
+        try:
+            return self.service_proxy.table_client.query_entities(
+                self.service_proxy.table_name_jobs,
+                filter='PartitionKey eq \'{}${}\''.format(fedhash, job_id)
+            )
+        except azure.common.AzureMissingResourceHttpError:
+            return None
+
     def get_messages_from_federation_queue(
             self,
             fedhash: str
@@ -528,12 +823,37 @@ class FederationDataHandler():
         return self.service_proxy.queue_client.get_messages(
             queue_name, num_messages=32, visibility_timeout=1)
 
-    def delete_message_from_federation_queue(
+    def _retrieve_and_pop_sequence(self, fedhash, job_id):
+        ent = self.get_sequence_entity_for_job(fedhash, job_id)
+        seq = ent['Sequence'].split(',')
+        seq.pop(0)
+        ent['Sequence'] = ','.join(seq)
+        return ent
+
+    def dequeue_unique_id_from_federation_sequence(
             self,
             fedhash: str,
             msg_id: str,
-            pop_receipt: str
+            pop_receipt: str,
+            target: str,
     ) -> None:
+        # pop first item off table sequence
+        if is_not_empty(target):
+            while True:
+                entity = self._retrieve_and_pop_sequence(fedhash, target)
+                try:
+                    etag = self.service_proxy.table_client.\
+                        insert_or_replace_entity(
+                            self.service_proxy.table_name_jobs, entity)
+                    logger.debug(
+                        'upserted target {} sequence to federation {} '
+                        'etag={}'.format(target, fedhash, etag))
+                    break
+                except azure.common.AzureConflictHttpError:
+                    logger.debug(
+                        'conflict upserting target {} sequence to '
+                        'federation {}'.format(target, fedhash))
+        # dequeue message
         queue_name = '{}-{}'.format(
             self.service_proxy.queue_prefix, fedhash)
         self.service_proxy.queue_client.delete_message(
@@ -654,25 +974,29 @@ class Federation():
             self,
             csh: ComputeServiceHandler,
             bsh: BatchServiceHandler,
-            entity: azure.cosmosdb.table.Entity
+            entity: azure.cosmosdb.table.Entity,
+            poolset: set,
     ) -> str:
+        rk = entity['RowKey']
         with self.lock:
-            rk = entity['RowKey']
             if rk in self.pools:
+                poolset.add(rk)
                 return rk
-            batch_account = entity['BatchAccount']
-            poolid = entity['PoolId']
-            service_url = entity['BatchServiceUrl']
-            location = entity['Location']
-            csh.populate_vm_sizes_from_location(location)
-            pool = bsh.get_pool_full_update(
-                batch_account, service_url, poolid)
-            vm_size = None
-            if pool is not None:
-                vm_size = csh.get_vm_size(pool.vm_size)
-            fedpool = FederationPool(
-                batch_account, service_url, location, poolid, pool, vm_size
-            )
+        batch_account = entity['BatchAccount']
+        poolid = entity['PoolId']
+        service_url = entity['BatchServiceUrl']
+        location = entity['Location']
+        csh.populate_vm_sizes_from_location(location)
+        pool = bsh.get_pool_full_update(
+            batch_account, service_url, poolid)
+        vm_size = None
+        if pool is not None:
+            vm_size = csh.get_vm_size(pool.vm_size)
+        fedpool = FederationPool(
+            batch_account, service_url, location, poolid, pool, vm_size
+        )
+        with self.lock:
+            poolset.add(rk)
             self.pools[rk] = fedpool
             if self.pools[rk].is_valid:
                 logger.info(
@@ -716,6 +1040,7 @@ class Federation():
         avail_lowpriority_vms = {}
         idle_dedicated_vms = {}
         idle_lowpriority_vms = {}
+        # TODO Parallelize
         for rk in self.pools:
             if rk in blacklist:
                 continue
@@ -772,13 +1097,12 @@ class Federation():
             return binned_idle_lp[0]
         return None
 
-    def schedule_job(
+    async def create_job(
             self,
             bsh: BatchServiceHandler,
             target_pool: str,
             job: batchmodels.JobAddParameter,
             constraints: Dict[str, Any],
-            task_map: Dict[str, batchmodels.TaskAddParameter],
     ) -> bool:
         """
         This function should be called with lock already held!
@@ -787,20 +1111,34 @@ class Federation():
         auto_complete = constraints['auto_complete']
         # get pool ref
         pool = self.pools[target_pool]
+        # overwrite pool id in job
+        job.pool_info.pool_id = pool.pool_id
         # add job
+        success = False
+        del_job = True
         try:
             logger.info('Adding job {} to pool {}'.format(
                 job.id, pool.pool_id))
             bsh.add_job(pool.batch_account, pool.service_url, job)
-        except batchmodels.batch_error.BatchErrorException as ex:
+            success = True
+            del_job = False
+        except batchmodels.batch_error.BatchErrorException as exc:
             if ('The specified job is already in a completed state.' in
-                    ex.message.value):
-                raise
-            elif 'The specified job already exists' in ex.message.value:
+                    exc.message.value):
+                del_job = False
+                logger.error(
+                    'cannot reuse completed job {} on pool {}'.format(
+                        job.id, pool.pool_id))
+            elif 'The specified job already exists' in exc.message.value:
+                del_job = False
+                success = True
                 # cannot re-use an existing job if multi-instance due to
                 # job release requirement
                 if multi_instance and auto_complete:
-                    raise
+                    logger.error(
+                        'cannot reuse job {} on pool {} with multi_instance '
+                        'and auto_complete'.format(job.id, pool.pool_id))
+                    success = False
                 else:
                     # retrieve job and check for version consistency
                     _job = bsh.get_job(
@@ -809,25 +1147,119 @@ class Federation():
                     # compatibility
                     if (job.uses_task_dependencies and
                             not _job.uses_task_dependencies):
-                        raise RuntimeError(
-                            ('existing job {} has an incompatible task '
-                             'dependency setting: existing={} '
+                        logger.error(
+                            ('existing job {} on pool {} has an incompatible '
+                             'task dependency setting: existing={} '
                              'desired={}').format(
-                                 job.id, _job.uses_task_dependencies,
+                                 job.id, pool.pool_id,
+                                 _job.uses_task_dependencies,
                                  job.uses_task_dependencies))
+                        success = False
                     if (_job.on_task_failure != job.on_task_failure):
-                        raise RuntimeError(
-                            ('existing job {} has an incompatible '
+                        logger.error(
+                            ('existing job {} on pool {} has an incompatible '
                              'on_task_failure setting: existing={} '
                              'desired={}').format(
-                                 job.id, _job.on_task_failure.value,
+                                 job.id, pool.pool_id,
+                                 _job.on_task_failure.value,
                                  job.on_task_failure.value))
+                        success = False
             else:
-                raise
+                logger.exception(str(exc))
+        if del_job:
+            await bsh.delete_job(
+                pool.batch_account, pool.service_url, job.id, wait=True)
+        return success
 
-        # TODO remap task ids given current job
-        # TODO submit task collection
-        raise RuntimeError()
+    def track_job(
+            self,
+            fdh: FederationDataHandler,
+            target_pool: str,
+            job_id: str,
+            unique_id: str,
+    ) -> None:
+        # get pool ref
+        pool = self.pools[target_pool]
+        # add to jobs table
+        entity = fdh.get_location_entity_for_job(self.hash, job_id, pool)
+        if entity is None:
+            pk, rk = fdh.generate_pk_rk_for_job_location_entity(
+                self.hash, job_id, pool)
+            entity = {
+                'PartitionKey': pk,
+                'RowKey': rk,
+                'PoolId': pool.pool_id,
+                'BatchAccount': pool.batch_account,
+                'ServiceUrl': pool.service_url,
+                'AdditionTimestamps': datetime_utcnow(as_string=True),
+                'UniqueIds': unique_id,
+            }
+        else:
+            entity['AdditionTimestamps'] = '{},{}'.format(
+                entity['AdditionTimestamps'], datetime_utcnow(as_string=True))
+            entity['UniqueIds'] = '{},{}'.format(
+                entity['UniqueIds'], datetime_utcnow(as_string=True))
+        logger.debug(
+            'upserting location entity for job {} uid {} on pool {} '
+            '(batch_account={} service_url={})'.format(
+                job_id, unique_id, pool.pool_id, pool.batch_account,
+                pool.service_url))
+        fdh.upsert_location_entity_for_job(entity)
+
+    def schedule_tasks(
+            self,
+            bsh: BatchServiceHandler,
+            target_pool: str,
+            job_id: str,
+            constraints: Dict[str, Any],
+            naming: Dict[str, Any],
+            task_map: Dict[str, batchmodels.TaskAddParameter],
+    ) -> None:
+        """
+        This function should be called with lock already held!
+        """
+        auto_complete = constraints['auto_complete']
+        try:
+            merge_task_id = constraints['merge_task']
+        except KeyError:
+            merge_task_id = None
+        # get pool ref
+        pool = self.pools[target_pool]
+        # re-assign task ids to current job:
+        # 1. sort task map keys
+        # 2. re-map task ids to current job
+        # 3. re-map merge task dependencies
+        last_tid = None
+        tasklist = None
+        task_ids = sorted(task_map.keys())
+        for tid in task_ids:
+            is_merge_task = tid == merge_task_id
+            tasklist, new_tid = bsh.regenerate_next_generic_task_id(
+                pool.batch_account, pool.service_url, job_id, naming, tid,
+                last_task_id=last_tid, tasklist=tasklist,
+                is_merge_task=is_merge_task)
+            task = task_map.pop(tid)
+            task_map[new_tid] = task
+            if is_merge_task:
+                merge_task_id = new_tid
+            tasklist.append(new_tid)
+            last_tid = new_tid
+        if merge_task_id is not None:
+            merge_task = task_map.pop(merge_task_id)
+            merge_task.depends_on = batchmodels.TaskDependencies(
+                task_ids=list(task_map.keys()),
+            )
+            task_map[merge_task_id] = merge_task
+
+        # TODO find orphaned task depends on/ranges - emit warning
+
+        # submit task collection
+        bsh.add_task_collection(
+            pool.batch_account, pool.service_url, job_id, task_map)
+        # set auto complete
+        if auto_complete:
+            bsh.set_auto_complete_on_job(
+                pool.batch_account, pool.service_url, job_id)
 
 
 class FederationProcessor():
@@ -850,29 +1282,38 @@ class FederationProcessor():
         with self._federation_lock:
             return len(self.federations) > 0
 
-    def update_federations(self):
+    def _update_federation(self, entity) -> None:
+        fedhash = entity['RowKey']
+        fedid = entity['FederationId']
+        if fedhash not in self.federations:
+            logger.debug('adding federation hash {} id: {}'.format(
+                fedhash, fedid))
+            self.federations[fedhash] = Federation(fedhash, fedid)
+        poolset = set()
+        pools = list(self.fdh.get_all_pools_for_federation(fedhash))
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_workers_for_executor(pools)) as executor:
+            for pool in pools:
+                executor.submit(
+                    self.federations[fedhash].update_pool,
+                    self.csh, self.bsh, pool, poolset)
+        self.federations[fedhash].trim_orphaned_pools(poolset)
+
+    def update_federations(self) -> None:
         """Update federations"""
-        logger.debug('starting federation update')
+        logger.debug('starting federations update')
         entities = list(self.fdh.get_all_federations())
         with self._federation_lock:
-            for entity in entities:
-                fedhash = entity['RowKey']
-                fedid = entity['FederationId']
-                if fedhash not in self.federations:
-                    logger.debug('adding federation hash {} id: {}'.format(
-                        fedhash, fedid))
-                    self.federations[fedhash] = Federation(fedhash, fedid)
-                poolset = set()
-                pools = self.fdh.get_all_pools_for_federation(fedhash)
-                for pool in pools:
-                    poolrk = self.federations[fedhash].update_pool(
-                        self.csh, self.bsh, pool)
-                    poolset.add(poolrk)
-                self.federations[fedhash].trim_orphaned_pools(poolset)
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max_workers_for_executor(
+                        entities)) as executor:
+                for entity in entities:
+                    executor.submit(self._update_federation, entity)
         logger.debug('completed federation update')
 
-    def add_job_v1(
-            self, fedhash, job_id, job, constraints, task_map, unique_id):
+    async def add_job_v1(
+            self, fedhash, job_id, job, constraints, naming, task_map,
+            unique_id):
         # get the number of tasks in job
         # try to match the appropriate pool for the tasks in job
         # add job to pool
@@ -882,71 +1323,161 @@ class FederationProcessor():
         num_tasks = len(task_map)
         logger.debug(
             'attempting to match job {} with {} tasks in fed {} '
-            'constraints={}'.format(job_id, num_tasks, fedhash, constraints))
+            'constraints={} naming={}'.format(
+                job_id, num_tasks, fedhash, constraints, naming))
         blacklist = set()
         while True:
+            # TODO implement graylist and blacklist
+            # blacklist = cannot schedule
+            # graylist = avoid scheduling
             poolrk = self.federations[fedhash].find_target_pool_for_job(
                 self.bsh, job, num_tasks, blacklist, unique_id)
             if poolrk is not None:
-                if self.federations[fedhash].schedule_job(
-                        self.bsh, poolrk, job, constraints, task_map):
+                cj = await self.federations[fedhash].create_job(
+                    self.bsh, poolrk, job, constraints)
+                if cj:
+                    self.federations[fedhash].track_job(
+                        self.fdh, poolrk, job.id, unique_id)
+                    self.federations[fedhash].schedule_tasks(
+                        self.bsh, poolrk, job.id, constraints, naming,
+                        task_map)
                     break
                 else:
                     blacklist.add(poolrk)
 
-    def process_message_action_v1(
-            self, fedhash, action, target_type, data, unique_id):
+    async def _terminate_job(self, fedhash, job_id, entity):
+        if 'TerminateTimestamp' in entity:
+            logger.debug(
+                'job {} for fed {} has already been terminated '
+                'at {}'.format(
+                    job_id, fedhash, entity['TerminateTimestamp']))
+            return
+        logger.debug(
+            'terminating job {} on pool {} for fed {} (batch_account={} '
+            'service_url={}'.format(
+                job_id, entity['PoolId'], fedhash, entity['BatchAccount'],
+                entity['ServiceUrl']))
+        await self.bsh.terminate_job(
+            entity['BatchAccount'], entity['ServiceUrl'], job_id)
+        entity['TerminateTimestamp'] = datetime_utcnow(as_string=False)
+        self.fdh.upsert_location_entity_for_job(entity)
+
+    async def _delete_job(self, fedhash, job_id, entity):
+        logger.debug(
+            'deleting job {} on pool {} for fed {} (batch_account={} '
+            'service_url={}'.format(
+                job_id, entity['PoolId'], fedhash, entity['BatchAccount'],
+                entity['ServiceUrl']))
+        await self.bsh.delete_job(
+            entity['BatchAccount'], entity['ServiceUrl'], job_id)
+        self.fdh.delete_location_entity_for_job(entity)
+
+    async def delete_or_terminate_job_v1(
+            self, delete, fedhash, job_id, unique_id):
+        # find all jobs scheduled across federation mathching the job id
+        entities = self.fdh.get_all_location_entities_for_job(fedhash, job_id)
+        # terminate each pool-level job representing federation job
+        tasks = []
+        coro = self._delete_job if delete else self._terminate_job
+        for entity in entities:
+            tasks.append(
+                asyncio.ensure_future(
+                    coro(fedhash, job_id, entity)))
+        if len(tasks) > 0:
+            await asyncio.wait(tasks)
+        else:
+            logger.warning(
+                'cannot {} job {} for fed {}, no location entities '
+                'exist (uid={})'.format(
+                    'delete' if delete else 'terminate', job_id, fedhash,
+                    unique_id))
+            return
+
+    async def process_message_action_v1(
+            self, fedhash, action, target_type, job_id, data, unique_id):
+        if is_not_empty(data) and data['version'] != '1':
+            logger.error('cannot process job data version {} for {}'.format(
+                data['version'], unique_id))
+            return
         if target_type == 'job_schedule':
             if action == 'add':
-                pass
-            else:
-                raise NotImplementedError()
+                if job_id != data[target_type]['id']:
+                    logger.error(
+                        'job schedule id mismatch q:{} != b:{} for '
+                        'fed {}'.format(
+                            job_id, data[target_type]['id'], fedhash))
+                    return
+            raise NotImplementedError()
         elif target_type == 'job':
-            job_id = data['job']['id']
             if action == 'add':
-                job = data['job']['data']
-                constraints = data['job']['constraints']
+                if job_id != data[target_type]['id']:
+                    logger.error(
+                        'job id mismatch q:{} != b:{} for fed {}'.format(
+                            job_id, data[target_type]['id'], fedhash))
+                    return
+                job = data[target_type]['data']
+                constraints = data[target_type]['constraints']
+                naming = data[target_type]['naming']
                 task_map = data['task_map']
-                self.add_job_v1(
-                    fedhash, job_id, job, constraints, task_map, unique_id)
+                await self.add_job_v1(
+                    fedhash, job_id, job, constraints, naming, task_map,
+                    unique_id)
+            elif action == 'terminate':
+                await self.delete_or_terminate_job_v1(
+                    False, fedhash, job_id, unique_id)
+            elif action == 'delete':
+                await self.delete_or_terminate_job_v1(
+                    True, fedhash, job_id, unique_id)
             else:
                 raise NotImplementedError()
         else:
             logger.error('unknown target type: {}'.format(target_type))
 
-    def process_queue_message_v1(
+    async def process_queue_message_v1(
             self,
             fedhash: str,
             msg: Dict[str, Any]
-    ) -> None:
+    ) -> Tuple[bool, str]:
         target_fedid = msg['federation_id']
         calc_fedhash = hash_federation_id(target_fedid)
         if calc_fedhash != fedhash:
             logger.error(
                 'federation hash mismatch, expected={} actual={} id={}'.format(
                     fedhash, calc_fedhash, target_fedid))
-            return
+            return True, None
         action = msg['action']['method']
         target_type = msg['action']['kind']
+        unique_id = msg[target_type]['uuid']
+        job_id = msg[target_type]['id']
+        # get sequence from table
+        entity = self.fdh.get_sequence_entity_for_job(fedhash, job_id)
+        seq = entity['Sequence'].split(',')
+        if len(seq) < 1:
+            logger.error(
+                'sequence length is non-positive for federation {}'.format(
+                    fedhash))
+            return True, None
+        if seq[0] != unique_id:
+            logger.warning(
+                'skipping queue message for fed {} that does not match first '
+                'sequence q:{} != t:{} for job {}'.format(
+                    fedhash, unique_id, seq[0], job_id))
+            return False, None
         job_data = None
-        unique_id = None
         # retrieve job/task data
-        if 'blob_data' in msg:
+        if 'blob_data' in msg[target_type]:
             blob_client, container, blob_name, data = \
-                self.fdh.retrieve_blob_data(msg['blob_data'])
+                self.fdh.retrieve_blob_data(msg[target_type]['blob_data'])
             job_data = pickle.loads(data, fix_imports=True)
-            unique_id = blob_name.split('.')[0]
-        # check version first
-        if job_data['version'] == '1':
-            self.process_message_action_v1(
-                fedhash, action, target_type, job_data, unique_id)
-        else:
-            logger.error('cannot process job data version {} for {}'.format(
-                job_data['version'], unique_id))
+        # process message
+        await self.process_message_action_v1(
+            fedhash, action, target_type, job_id, job_data, unique_id)
         # delete blob
-        self.fdh.delete_blob(blob_client, container, blob_name)
+        if job_data is not None:
+            self.fdh.delete_blob(blob_client, container, blob_name)
+        return True, job_id
 
-    def process_federation_queue(self, fedhash: str) -> None:
+    async def process_federation_queue(self, fedhash: str) -> None:
         acquired = self.federations[fedhash].lock.acquire(blocking=False)
         if not acquired:
             logger.debug('could not acquire lock on federation {}'.format(
@@ -955,27 +1486,45 @@ class FederationProcessor():
         try:
             msgs = self.fdh.get_messages_from_federation_queue(fedhash)
             for msg in msgs:
+                if not await self.check_global_lock(backoff=False):
+                    return
                 msg_data = json.loads(msg.content, encoding='utf8')
                 if msg_data['version'] == '1':
-                    self.process_queue_message_v1(fedhash, msg_data)
+                    del_msg, target = await self.process_queue_message_v1(
+                        fedhash, msg_data)
                 else:
                     logger.error(
                         'cannot process message version {} for fed {}'.format(
                             msg_data['version'], fedhash))
+                    del_msg = True
+                    target = None
                 # delete message
-                self.fdh.delete_message_from_federation_queue(
-                    fedhash, msg.id, msg.pop_receipt)
+                if del_msg:
+                    self.fdh.dequeue_unique_id_from_federation_sequence(
+                        fedhash, msg.id, msg.pop_receipt, target)
         finally:
             self.federations[fedhash].lock.release()
+
+    async def check_global_lock(
+        self,
+        backoff: bool=True
+    ) -> Generator[None, None, None]:
+        if not self.fdh.has_global_lock:
+            if backoff:
+                await asyncio.sleep(5 + random.randint(0, 5))
+            return False
+        return True
 
     async def iterate_and_process_federation_queues(
         self
     ) -> Generator[None, None, None]:
         while True:
+            if not await self.check_global_lock():
+                continue
             if self.federations_available:
                 # TODO process in parallel
                 for fedhash in self.federations:
-                    self.process_federation_queue(fedhash)
+                    await self.process_federation_queue(fedhash)
             await asyncio.sleep(5)
 
     async def poll_for_federations(
@@ -987,9 +1536,13 @@ class FederationProcessor():
         """
         logger.debug('polling federation table {} every {} sec'.format(
             self._service_proxy.table_name_global, self.fed_refresh_interval))
+        # lease global lock blob
+        self.fdh.lease_global_lock(loop)
         asyncio.ensure_future(
             self.iterate_and_process_federation_queues(), loop=loop)
         while True:
+            if not await self.check_global_lock():
+                continue
             self.update_federations()
             await asyncio.sleep(self.fed_refresh_interval)
 

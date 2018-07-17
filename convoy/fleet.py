@@ -3690,8 +3690,8 @@ def action_jobs_add(
     # add jobs
     is_windows = settings.is_windows_pool(config)
     batch.add_jobs(
-        batch_client, blob_client, None, keyvault_client, config, autopool,
-        _IMAGE_BLOCK_FILE,
+        batch_client, blob_client, None, None, keyvault_client, config,
+        autopool, _IMAGE_BLOCK_FILE,
         _BLOBXFER_WINDOWS_FILE if is_windows else _BLOBXFER_FILE,
         recreate, tail)
 
@@ -4609,7 +4609,33 @@ def action_fed_jobs_add(
         raise ValueError('federation id is invalid')
     is_windows = settings.is_windows_pool(config)
     batch.add_jobs(
-        batch_client, blob_client, queue_client, keyvault_client, config,
-        None, _IMAGE_BLOCK_FILE,
+        batch_client, blob_client, table_client, queue_client, keyvault_client,
+        config, None, _IMAGE_BLOCK_FILE,
         _BLOBXFER_WINDOWS_FILE if is_windows else _BLOBXFER_FILE,
         recreate=False, tail=None, federation_id=federation_id)
+
+
+def action_fed_jobs_del_or_term(
+        table_client, queue_client, config, delete, federation_id, jobid,
+        jobscheduleid):
+    # type: (azure.cosmosdb.table.TableService,
+    #        azure.storage.queue.QueueService, dict, bool, str, str) -> None
+    """Action: Fed Jobs Del or Term
+    :param azure.batch.batch_service_client.BatchServiceClient batch_client:
+        batch client
+    :param azure.storage.blob.BlockBlobService blob_client: blob client
+    :param azure.cosmosdb.table.TableService table_client: table client
+    :param dict config: configuration dict
+    :param bool delete: delete instead of terminate
+    :param str federation_id: federation id
+    :param str jobid: job id
+    :param str jobscheduleid: job schedule id
+    """
+    if jobid is None and jobscheduleid is None:
+        raise ValueError('specify one of --jobid or --jobscheduleid')
+    if jobid is not None and jobscheduleid is not None:
+        raise ValueError('cannot specify both --jobid and --jobscheduleid')
+    unique_id = uuid.uuid4()
+    storage.delete_or_terminate_job_from_federation(
+        table_client, queue_client, delete, federation_id, unique_id, jobid,
+        jobscheduleid)

@@ -53,6 +53,7 @@ util.setup_logger(logger)
 _MONITOR_BATCHPOOL_PK = 'BatchPool'
 _MONITOR_REMOTEFS_PK = 'RemoteFS'
 _ALL_FEDERATIONS_PK = '!!FEDERATIONS'
+_FEDERATION_ACTIONS_PREFIX_PK = '!!ACTIONS'
 _DEFAULT_SAS_EXPIRY_DAYS = 365 * 30
 _STORAGEACCOUNT = None
 _STORAGEACCOUNTKEY = None
@@ -790,18 +791,112 @@ def remove_pool_from_federation(
                 poolid, federation_id))
 
 
-def add_job_to_federation(queue_client, federation_id, msg):
-    # type: (azure.queue.QueueService, str, dict) -> None
+def _retrieve_and_merge_sequence(table_client, pk, rk, unique_id):
+    try:
+        ent = table_client.get_entity(
+            _STORAGE_CONTAINERS['table_federation_jobs'], pk, rk)
+        if util.is_not_empty(ent['Sequence']):
+            ent['Sequence'] = '{},{}'.format(ent['Sequence'], unique_id)
+        else:
+            ent['Sequence'] = str(unique_id)
+    except azure.common.AzureMissingResourceHttpError:
+        ent = {
+            'PartitionKey': pk,
+            'RowKey': rk,
+            'Sequence': str(unique_id),
+        }
+    return ent
+
+
+def add_job_to_federation(
+        table_client, queue_client, federation_id, job_id, unique_id, msg):
+    # type: (azure.cosmosdb.TableService, azure.queue.QueueService, str,
+    #        str, uuid.UUID, dict) -> None
     """Add a job to a federation
+    :param azure.cosmosdb.table.TableService table_client: table client
     :param azure.storage.queue.QueueService queue_service: queue client
     :param str federation_id: federation id
+    :param str job_id: job or job schedule id
+    :param uuid.UUID unique_id: unique id
     :param dict msg: dict payload
     """
     fedhash = hash_federation_id(federation_id)
+    pk = '{}${}'.format(_FEDERATION_ACTIONS_PREFIX_PK, fedhash)
+    rk = job_id
+    # upsert unique id to sequence
+    while True:
+        entity = _retrieve_and_merge_sequence(table_client, pk, rk, unique_id)
+        try:
+            etag = table_client.insert_or_replace_entity(
+                _STORAGE_CONTAINERS['table_federation_jobs'], entity)
+            logger.debug(
+                'upserted job {} sequence uid {} to federation {} '
+                'etag={}'.format(job_id, unique_id, federation_id, etag))
+            break
+        except azure.common.AzureConflictHttpError:
+            logger.debug(
+                'conflict upserting job {} sequence uid {} to '
+                'federation {}'.format(job_id, unique_id, federation_id))
+    # add queue message
+    msg_data = json.dumps(msg, ensure_ascii=True)
     contname = '{}-{}'.format(
         _STORAGE_CONTAINERS['queue_federation'], fedhash)
-    msg_data = json.dumps(msg, ensure_ascii=True)
     queue_client.put_message(contname, msg_data, time_to_live=-1)
+
+
+def delete_or_terminate_job_from_federation(
+        table_client, queue_client, delete, federation_id, unique_id,
+        job_id, job_schedule_id):
+    # type: (azure.cosmosdb.TableService, azure.queue.QueueService, bool, str,
+    #        uuid.UUID, str, str) -> None
+    """Delete or terminate a job from a federation
+    :param azure.cosmosdb.table.TableService table_client: table client
+    :param azure.storage.queue.QueueService queue_service: queue client
+    :param bool delete: delete instead of terminate
+    :param str federation_id: federation id
+    :param uuid.UUID unique_id: unique id
+    :param str job_id: job id
+    :param str job_schedule_id: job schedule id
+    """
+    fedhash = hash_federation_id(federation_id)
+    pk = '{}${}'.format(_FEDERATION_ACTIONS_PREFIX_PK, fedhash)
+    target = job_id if util.is_not_empty(job_id) else job_schedule_id
+    # upsert unique id to sequence
+    while True:
+        entity = _retrieve_and_merge_sequence(
+            table_client, pk, target, unique_id)
+        try:
+            etag = table_client.insert_or_replace_entity(
+                _STORAGE_CONTAINERS['table_federation_jobs'], entity)
+            logger.debug(
+                'upserted job {} sequence uid {} to federation {} '
+                'etag={}'.format(job_id, unique_id, federation_id, etag))
+            break
+        except azure.common.AzureConflictHttpError:
+            logger.debug(
+                'conflict upserting job {} sequence uid {} to '
+                'federation {}'.format(job_id, unique_id, federation_id))
+    # add queue message
+    kind = 'job' if util.is_not_empty(job_id) else 'job_schedule'
+    method = 'delete' if delete else 'terminate'
+    msg = {
+        'version': '1',
+        'federation_id': federation_id,
+        'action': {
+            'method': method,
+            'kind': kind,
+        },
+        kind: {
+            'id': target,
+            'uuid': str(unique_id),
+        },
+    }
+    msg_data = json.dumps(msg, ensure_ascii=True)
+    contname = '{}-{}'.format(
+        _STORAGE_CONTAINERS['queue_federation'], fedhash)
+    queue_client.put_message(contname, msg_data, time_to_live=-1)
+    logger.debug('enqueued {} of {} {} for federation {}'.format(
+        method, kind, target, federation_id))
 
 
 def _check_file_and_upload(blob_client, file, key, container=None):
@@ -862,7 +957,7 @@ def upload_for_nonbatch(blob_client, files, kind):
     :param azure.storage.blob.BlockBlobService blob_client: blob client
     :param dict config: configuration dict
     :param list files: files to upload
-    :param str kind: kind, "remotefs" or "monitoring"
+    :param str kind: "remotefs", "monitoring" or "federation"
     :rtype: list
     :return: list of file urls
     """
@@ -876,6 +971,19 @@ def upload_for_nonbatch(blob_client, files, kind):
             _STORAGEACCOUNT, _STORAGEACCOUNTEP,
             _STORAGE_CONTAINERS[key], file[0]))
     return ret
+
+
+def create_global_lock_blob(blob_client, kind):
+    # type: (azure.storage.blob.BlockBlobService, str) -> None
+    """Create a global lock blob
+    :param azure.storage.blob.BlockBlobService blob_client: blob client
+    :param str kind: "remotefs", "monitoring" or "federation"
+    """
+    if kind == 'federation':
+        kind = '{}_global'.format(kind.lower())
+    key = 'blob_{}'.format(kind.lower())
+    blob_client.create_blob_from_bytes(
+        _STORAGE_CONTAINERS[key], 'global.lock', b'')
 
 
 def upload_job_for_federation(blob_client, federation_id, files):

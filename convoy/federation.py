@@ -181,6 +181,8 @@ def create_federation_proxy(
     # create storage container
     storage.create_storage_containers_nonbatch(
         blob_client, table_client, queue_client, 'federation')
+    # create global lock
+    storage.create_global_lock_blob(blob_client, 'federation')
     # upload scripts to blob storage for customscript vm extension
     blob_urls = storage.upload_for_nonbatch(
         blob_client, federation_files, 'federation')

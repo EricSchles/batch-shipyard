@@ -2584,6 +2584,44 @@ def fed_jobs_add(ctx, federation_id):
         ctx.table_client, ctx.queue_client, ctx.config, federation_id)
 
 
+@jobs.command('term')
+@click.argument('federation-id')
+@click.option(
+    '--jobid', help='Terminate the specified job id')
+@click.option(
+    '--jobscheduleid', help='Terminate the specified job schedule id')
+@common_options
+@federation_options
+@keyvault_options
+@aad_options
+@pass_cli_context
+def fed_jobs_term(ctx, federation_id, jobid, jobscheduleid):
+    """Terminate a job or job schedule in a federation"""
+    ctx.initialize_for_federation()
+    convoy.fleet.action_fed_jobs_del_or_term(
+        ctx.table_client, ctx.queue_client, ctx.config,
+        False, federation_id, jobid, jobscheduleid)
+
+
+@jobs.command('del')
+@click.argument('federation-id')
+@click.option(
+    '--jobid', help='Delete the specified job id')
+@click.option(
+    '--jobscheduleid', help='Delete the specified job schedule id')
+@common_options
+@federation_options
+@keyvault_options
+@aad_options
+@pass_cli_context
+def fed_jobs_del(ctx, federation_id, jobid, jobscheduleid):
+    """Delete a job or job schedule in a federation"""
+    ctx.initialize_for_federation()
+    convoy.fleet.action_fed_jobs_del_or_term(
+        ctx.table_client, ctx.queue_client, ctx.config,
+        True, federation_id, jobid, jobscheduleid)
+
+
 if __name__ == '__main__':
     convoy.util.setup_logger(logger)
     cli()
