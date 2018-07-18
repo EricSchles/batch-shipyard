@@ -4589,7 +4589,7 @@ def action_fed_id_destroy(
         return
     logger.info('destroying federation id: {}'.format(federation_id))
     storage.destroy_federation_id(
-        blob_client, table_client, queue_client, federation_id.lower())
+        blob_client, table_client, queue_client, config, federation_id.lower())
 
 
 def action_fed_jobs_add(
@@ -4617,7 +4617,7 @@ def action_fed_jobs_add(
 
 def action_fed_jobs_del_or_term(
         table_client, queue_client, config, delete, federation_id, jobid,
-        jobscheduleid):
+        jobscheduleid, all_jobs, all_jobschedules):
     # type: (azure.cosmosdb.table.TableService,
     #        azure.storage.queue.QueueService, dict, bool, str, str) -> None
     """Action: Fed Jobs Del or Term
@@ -4631,11 +4631,15 @@ def action_fed_jobs_del_or_term(
     :param str jobid: job id
     :param str jobscheduleid: job schedule id
     """
-    if jobid is None and jobscheduleid is None:
-        raise ValueError('specify one of --jobid or --jobscheduleid')
     if jobid is not None and jobscheduleid is not None:
         raise ValueError('cannot specify both --jobid and --jobscheduleid')
-    unique_id = uuid.uuid4()
+    if all_jobs:
+        if jobid is not None:
+            raise ValueError('cannot specify both --all-jobs and --jobid')
+    elif all_jobschedules:
+        if jobscheduleid is not None:
+            raise ValueError(
+                'cannot specify both --all-jobschedules and --jobscheduleid')
     storage.delete_or_terminate_job_from_federation(
-        table_client, queue_client, delete, federation_id, unique_id, jobid,
-        jobscheduleid)
+        table_client, queue_client, delete, federation_id, jobid,
+        jobscheduleid, all_jobs, all_jobschedules)

@@ -417,6 +417,15 @@ class BatchServiceHandler():
                 'could not retrieve pool {} node counts (account={} '
                 'service_url={})'.format(pool_id, batch_account, service_url))
 
+    def add_job_schedule(
+            self,
+            batch_account: str,
+            service_url: str,
+            jobschedule: batchmodels.JobScheduleAddParameter,
+    ) -> None:
+        client = self.service_proxy.batch_client(batch_account, service_url)
+        client.job_schedule.add(jobschedule)
+
     def get_job(
             self,
             batch_account: str,
@@ -435,57 +444,47 @@ class BatchServiceHandler():
         client = self.service_proxy.batch_client(batch_account, service_url)
         client.job.add(job)
 
-    async def terminate_job(
+    async def delete_or_terminate_job(
             self,
             batch_account: str,
             service_url: str,
             job_id: str,
+            delete: bool,
+            is_job_schedule: bool,
             wait: bool=False,
     ) -> None:
-        logger.debug('terminating job {} (account={} service_url={})'.format(
-            job_id, batch_account, service_url))
+        action = 'delete' if delete else 'terminate'
+        cstate = (
+            batchmodels.JobScheduleState.completed if is_job_schedule else
+            batchmodels.JobState.completed
+        )
         client = self.service_proxy.batch_client(batch_account, service_url)
+        iface = client.job_schedule if is_job_schedule else client.job
+        logger.debug('{} {} {} (account={} service_url={})'.format(
+            action, 'job schedule' if is_job_schedule else 'job',
+            job_id, batch_account, service_url))
         try:
-            client.job.terminate(job_id)
+            if delete:
+                iface.delete(job_id)
+            else:
+                iface.terminate(job_id)
         except batchmodels.batch_error.BatchErrorException as exc:
-            if ('completed state' in exc.message.value or
-                    'marked for deletion' in exc.message.value):
-                return
-        # wait for job to terminate
+            if delete:
+                if ('does not exist' in exc.message.value or
+                        (not wait and
+                         'marked for deletion' in exc.message.value)):
+                    return
+            else:
+                if ('completed state' in exc.message.value or
+                        'marked for deletion' in exc.message.value):
+                    return
+        # wait for job to delete/terminate
         if wait:
             while True:
                 try:
-                    _job = client.job.get(job_id)
-                    if _job.state == batchmodels.JobState.completed:
+                    _job = iface.get(job_id)
+                    if _job.state == cstate:
                         break
-                except batchmodels.batch_error.BatchErrorException as exc:
-                    if 'does not exist' in exc.message.value:
-                        break
-                    else:
-                        raise
-                await asyncio.sleep(1)
-
-    async def delete_job(
-            self,
-            batch_account: str,
-            service_url: str,
-            job_id: str,
-            wait: bool=False,
-    ) -> None:
-        logger.debug('deleting job {} (account={} service_url={})'.format(
-            job_id, batch_account, service_url))
-        client = self.service_proxy.batch_client(batch_account, service_url)
-        try:
-            client.job.delete(job_id)
-        except batchmodels.batch_error.BatchErrorException as exc:
-            if ('does not exist' in exc.message.value or
-                    'marked for deletion' in exc.message.value):
-                return
-        # wait for job to delete
-        if wait:
-            while True:
-                try:
-                    client.job.get(job_id)
                 except batchmodels.batch_error.BatchErrorException as exc:
                     if 'does not exist' in exc.message.value:
                         break
@@ -650,6 +649,10 @@ class BatchServiceHandler():
         """
         client = self.service_proxy.batch_client(batch_account, service_url)
         all_tasks = list(task_map.values())
+        if len(all_tasks) == 0:
+            logger.debug(
+                'no tasks detected in task_map for job {}'.format(job_id))
+            return
         slice = 100  # can only submit up to 100 tasks at a time
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=_MAX_EXECUTOR_WORKERS) as executor:
@@ -964,11 +967,11 @@ class FederationPool():
 
 
 class Federation():
-    def __init__(self, fedhash, fedid):
+    def __init__(self, fedhash: str, fedid: str) -> None:
         self.lock = threading.Lock()
         self.hash = fedhash
         self.id = fedid
-        self.pools = {}
+        self.pools = {}  # type: Dict[str, FederationPool]
 
     def update_pool(
             self,
@@ -1027,8 +1030,8 @@ class Federation():
     def find_target_pool_for_job(
             self,
             bsh: BatchServiceHandler,
-            job: batchmodels.JobAddParameter,
             num_tasks: int,
+            constraints: Dict[str, Any],
             blacklist: Set[str],
             unique_id: str
     ) -> Optional[str]:
@@ -1096,6 +1099,37 @@ class Federation():
                 idle_lowpriority_vms, key=idle_lowpriority_vms.get)
             return binned_idle_lp[0]
         return None
+
+    async def create_job_schedule(
+            self,
+            bsh: BatchServiceHandler,
+            target_pool: str,
+            jobschedule: batchmodels.JobScheduleAddParameter,
+            constraints: Dict[str, Any],
+    ) -> bool:
+        """
+        This function should be called with lock already held!
+        """
+        # get pool ref
+        pool = self.pools[target_pool]
+        # overwrite pool id in job schedule
+        jobschedule.job_specification.pool_info.pool_id = pool.pool_id
+        # add job schedule
+        try:
+            logger.info('Adding job schedule {} to pool {}'.format(
+                jobschedule.id, pool.pool_id))
+            bsh.add_job_schedule(
+                pool.batch_account, pool.service_url, jobschedule)
+            success = True
+        except batchmodels.batch_error.BatchErrorException as exc:
+            if 'already exists' not in exc.message.value:
+                await bsh.delete_or_terminate_job(
+                    pool.batch_account, pool.service_url, jobschedule.id,
+                    True, True, wait=True)
+            else:
+                logger.error(str(exc))
+            success = False
+        return success
 
     async def create_job(
             self,
@@ -1167,8 +1201,9 @@ class Federation():
             else:
                 logger.exception(str(exc))
         if del_job:
-            await bsh.delete_job(
-                pool.batch_account, pool.service_url, job.id, wait=True)
+            await bsh.delete_or_terminate_job(
+                pool.batch_account, pool.service_url, job.id, True, False,
+                wait=True)
         return success
 
     def track_job(
@@ -1291,6 +1326,9 @@ class FederationProcessor():
             self.federations[fedhash] = Federation(fedhash, fedid)
         poolset = set()
         pools = list(self.fdh.get_all_pools_for_federation(fedhash))
+        if len(pools) == 0:
+            logger.debug('no pools detected for federation {}'.format(fedhash))
+            return
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=max_workers_for_executor(pools)) as executor:
             for pool in pools:
@@ -1301,8 +1339,10 @@ class FederationProcessor():
 
     def update_federations(self) -> None:
         """Update federations"""
-        logger.debug('starting federations update')
         entities = list(self.fdh.get_all_federations())
+        if len(entities) == 0:
+            return
+        logger.debug('starting federations update')
         with self._federation_lock:
             with concurrent.futures.ThreadPoolExecutor(
                     max_workers=max_workers_for_executor(
@@ -1312,8 +1352,7 @@ class FederationProcessor():
         logger.debug('completed federation update')
 
     async def add_job_v1(
-            self, fedhash, job_id, job, constraints, naming, task_map,
-            unique_id):
+            self, fedhash, job, constraints, naming, task_map, unique_id):
         # get the number of tasks in job
         # try to match the appropriate pool for the tasks in job
         # add job to pool
@@ -1324,14 +1363,14 @@ class FederationProcessor():
         logger.debug(
             'attempting to match job {} with {} tasks in fed {} '
             'constraints={} naming={}'.format(
-                job_id, num_tasks, fedhash, constraints, naming))
+                job.id, num_tasks, fedhash, constraints, naming))
         blacklist = set()
         while True:
             # TODO implement graylist and blacklist
             # blacklist = cannot schedule
             # graylist = avoid scheduling
             poolrk = self.federations[fedhash].find_target_pool_for_job(
-                self.bsh, job, num_tasks, blacklist, unique_id)
+                self.bsh, num_tasks, constraints, blacklist, unique_id)
             if poolrk is not None:
                 cj = await self.federations[fedhash].create_job(
                     self.bsh, poolrk, job, constraints)
@@ -1344,37 +1383,76 @@ class FederationProcessor():
                     break
                 else:
                     blacklist.add(poolrk)
+            else:
+                await asyncio.sleep(1 + random.randint(0, 5))
 
-    async def _terminate_job(self, fedhash, job_id, entity):
+    async def add_job_schedule_v1(
+            self, fedhash, job_schedule, constraints, unique_id):
+        # get the number of tasks in job
+        # try to match the appropriate pool for the tasks in job
+        # add job to pool
+        # if job exists, ensure settings match
+        # add tasks to job
+        # record mapping in fedjobs table
+        num_tasks = constraints['tasks_per_recurrence']
+        logger.debug(
+            'attempting to match job schedule {} with {} tasks in fed {} '
+            'constraints={}'.format(
+                job_schedule.id, num_tasks, fedhash, constraints))
+        blacklist = set()
+        while True:
+            # TODO implement graylist and blacklist
+            # blacklist = cannot schedule
+            # graylist = avoid scheduling
+            poolrk = self.federations[fedhash].find_target_pool_for_job(
+                self.bsh, num_tasks, constraints, blacklist, unique_id)
+            if poolrk is not None:
+                cj = await self.federations[fedhash].create_job_schedule(
+                    self.bsh, poolrk, job_schedule, constraints)
+                if cj:
+                    self.federations[fedhash].track_job(
+                        self.fdh, poolrk, job_schedule.id, unique_id)
+                    break
+                else:
+                    blacklist.add(poolrk)
+            else:
+                await asyncio.sleep(1 + random.randint(0, 5))
+
+    async def _terminate_job(self, fedhash, job_id, is_job_schedule, entity):
         if 'TerminateTimestamp' in entity:
             logger.debug(
-                'job {} for fed {} has already been terminated '
+                '{} {} for fed {} has already been terminated '
                 'at {}'.format(
+                    'job schedule' if is_job_schedule else 'job',
                     job_id, fedhash, entity['TerminateTimestamp']))
             return
         logger.debug(
-            'terminating job {} on pool {} for fed {} (batch_account={} '
+            'terminating {} {} on pool {} for fed {} (batch_account={} '
             'service_url={}'.format(
+                'job schedule' if is_job_schedule else 'job',
                 job_id, entity['PoolId'], fedhash, entity['BatchAccount'],
                 entity['ServiceUrl']))
-        await self.bsh.terminate_job(
-            entity['BatchAccount'], entity['ServiceUrl'], job_id)
+        await self.bsh.delete_or_terminate_job(
+            entity['BatchAccount'], entity['ServiceUrl'], job_id, False,
+            is_job_schedule, wait=False)
         entity['TerminateTimestamp'] = datetime_utcnow(as_string=False)
         self.fdh.upsert_location_entity_for_job(entity)
 
-    async def _delete_job(self, fedhash, job_id, entity):
+    async def _delete_job(self, fedhash, job_id, is_job_schedule, entity):
         logger.debug(
-            'deleting job {} on pool {} for fed {} (batch_account={} '
+            'deleting {} {} on pool {} for fed {} (batch_account={} '
             'service_url={}'.format(
+                'job schedule' if is_job_schedule else 'job',
                 job_id, entity['PoolId'], fedhash, entity['BatchAccount'],
                 entity['ServiceUrl']))
-        await self.bsh.delete_job(
-            entity['BatchAccount'], entity['ServiceUrl'], job_id)
+        await self.bsh.delete_or_terminate_job(
+            entity['BatchAccount'], entity['ServiceUrl'], job_id, True,
+            is_job_schedule, wait=False)
         self.fdh.delete_location_entity_for_job(entity)
 
     async def delete_or_terminate_job_v1(
-            self, delete, fedhash, job_id, unique_id):
-        # find all jobs scheduled across federation mathching the job id
+            self, delete, fedhash, job_id, is_job_schedule, unique_id):
+        # find all jobs across federation mathching the id
         entities = self.fdh.get_all_location_entities_for_job(fedhash, job_id)
         # terminate each pool-level job representing federation job
         tasks = []
@@ -1382,15 +1460,16 @@ class FederationProcessor():
         for entity in entities:
             tasks.append(
                 asyncio.ensure_future(
-                    coro(fedhash, job_id, entity)))
+                    coro(fedhash, job_id, is_job_schedule, entity)))
         if len(tasks) > 0:
             await asyncio.wait(tasks)
         else:
             logger.warning(
-                'cannot {} job {} for fed {}, no location entities '
+                'cannot {} {} {} for fed {}, no location entities '
                 'exist (uid={})'.format(
-                    'delete' if delete else 'terminate', job_id, fedhash,
-                    unique_id))
+                    'delete' if delete else 'terminate',
+                    'job schedule' if is_job_schedule else 'job',
+                    job_id, fedhash, unique_id))
             return
 
     async def process_message_action_v1(
@@ -1407,7 +1486,18 @@ class FederationProcessor():
                         'fed {}'.format(
                             job_id, data[target_type]['id'], fedhash))
                     return
-            raise NotImplementedError()
+                job_schedule = data[target_type]['data']
+                constraints = data[target_type]['constraints']
+                await self.add_job_schedule_v1(
+                    fedhash, job_schedule, constraints, unique_id)
+            elif action == 'terminate':
+                await self.delete_or_terminate_job_v1(
+                    False, fedhash, job_id, True, unique_id)
+            elif action == 'delete':
+                await self.delete_or_terminate_job_v1(
+                    True, fedhash, job_id, True, unique_id)
+            else:
+                raise NotImplementedError()
         elif target_type == 'job':
             if action == 'add':
                 if job_id != data[target_type]['id']:
@@ -1420,14 +1510,13 @@ class FederationProcessor():
                 naming = data[target_type]['naming']
                 task_map = data['task_map']
                 await self.add_job_v1(
-                    fedhash, job_id, job, constraints, naming, task_map,
-                    unique_id)
+                    fedhash, job, constraints, naming, task_map, unique_id)
             elif action == 'terminate':
                 await self.delete_or_terminate_job_v1(
-                    False, fedhash, job_id, unique_id)
+                    False, fedhash, job_id, False, unique_id)
             elif action == 'delete':
                 await self.delete_or_terminate_job_v1(
-                    True, fedhash, job_id, unique_id)
+                    True, fedhash, job_id, False, unique_id)
             else:
                 raise NotImplementedError()
         else:

@@ -204,7 +204,7 @@ class CliContext(object):
         self._init_config(
             skip_global_config=False, skip_pool_config=not init_batch,
             skip_monitor_config=True, skip_federation_config=False,
-            fs_storage=True)
+            fs_storage=not init_batch)
         self._ensure_credentials_section('storage')
         self.auth_client, self.resource_client, self.compute_client, \
             self.network_client, self.storage_mgmt_client, _, \
@@ -212,7 +212,7 @@ class CliContext(object):
                 self, batch_clients=init_batch)
         # inject storage account keys if via aad
         convoy.fleet.fetch_storage_account_keys_from_aad(
-            self.storage_mgmt_client, self.config, fs_storage=True)
+            self.storage_mgmt_client, self.config, fs_storage=not init_batch)
         self.blob_client, self.table_client, self.queue_client = \
             convoy.clients.create_storage_clients()
         self._cleanup_after_initialize()
@@ -2572,6 +2572,7 @@ def jobs(ctx):
 @jobs.command('add')
 @click.argument('federation-id')
 @common_options
+@batch_options
 @federation_options
 @keyvault_options
 @aad_options
@@ -2587,6 +2588,11 @@ def fed_jobs_add(ctx, federation_id):
 @jobs.command('term')
 @click.argument('federation-id')
 @click.option(
+    '--all-jobs', is_flag=True, help='Terminate all jobs in federation')
+@click.option(
+    '--all-jobschedules', is_flag=True,
+    help='Terminate all job schedules in federation')
+@click.option(
     '--jobid', help='Terminate the specified job id')
 @click.option(
     '--jobscheduleid', help='Terminate the specified job schedule id')
@@ -2595,16 +2601,22 @@ def fed_jobs_add(ctx, federation_id):
 @keyvault_options
 @aad_options
 @pass_cli_context
-def fed_jobs_term(ctx, federation_id, jobid, jobscheduleid):
+def fed_jobs_term(
+        ctx, all_jobs, all_jobschedules, federation_id, jobid, jobscheduleid):
     """Terminate a job or job schedule in a federation"""
     ctx.initialize_for_federation()
     convoy.fleet.action_fed_jobs_del_or_term(
         ctx.table_client, ctx.queue_client, ctx.config,
-        False, federation_id, jobid, jobscheduleid)
+        False, federation_id, jobid, jobscheduleid, all_jobs, all_jobschedules)
 
 
 @jobs.command('del')
 @click.argument('federation-id')
+@click.option(
+    '--all-jobs', is_flag=True, help='Delete all jobs in federation')
+@click.option(
+    '--all-jobschedules', is_flag=True,
+    help='Delete all job schedules in federation')
 @click.option(
     '--jobid', help='Delete the specified job id')
 @click.option(
@@ -2614,12 +2626,13 @@ def fed_jobs_term(ctx, federation_id, jobid, jobscheduleid):
 @keyvault_options
 @aad_options
 @pass_cli_context
-def fed_jobs_del(ctx, federation_id, jobid, jobscheduleid):
+def fed_jobs_del(
+        ctx, all_jobs, all_jobschedules, federation_id, jobid, jobscheduleid):
     """Delete a job or job schedule in a federation"""
     ctx.initialize_for_federation()
     convoy.fleet.action_fed_jobs_del_or_term(
         ctx.table_client, ctx.queue_client, ctx.config,
-        True, federation_id, jobid, jobscheduleid)
+        True, federation_id, jobid, jobscheduleid, all_jobs, all_jobschedules)
 
 
 if __name__ == '__main__':

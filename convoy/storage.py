@@ -35,6 +35,7 @@ import hashlib
 import json
 import logging
 import re
+import uuid
 # non-stdlib imports
 import azure.common
 import azure.cosmosdb.table as azuretable
@@ -668,35 +669,129 @@ def create_federation_id(
     queue_client.create_queue(contname)
 
 
+def batch_delete_entities(table_client, table_name, pk, rks):
+    if util.is_none_or_empty(rks):
+        return
+    i = 0
+    tb = azuretable.TableBatch()
+    for rk in rks:
+        tb.delete_entity(pk, rk)
+        i += 1
+        if i == 100:
+            table_client.commit_batch(table_name, tb)
+            tb = azuretable.TableBatch()
+            i = 0
+    if i > 0:
+        table_client.commit_batch(table_name, tb)
+
+
+def collate_all_location_entities_for_job(table_client, fedhash, entity):
+    loc_pk = '{}${}'.format(fedhash, entity['RowKey'])
+    rks = []
+    try:
+        loc_entities = table_client.query_entities(
+            _STORAGE_CONTAINERS['table_federation_jobs'],
+            filter='PartitionKey eq \'{}\''.format(loc_pk))
+    except azure.common.AzureMissingResourceHttpError:
+        pass
+    else:
+        for loc_entity in loc_entities:
+            rks.append(loc_entity['RowKey'])
+    return loc_pk, rks
+
+
+def get_all_federation_jobs(table_client, fedhash):
+    pk = '{}${}'.format(_FEDERATION_ACTIONS_PREFIX_PK, fedhash)
+    try:
+        entities = table_client.query_entities(
+            _STORAGE_CONTAINERS['table_federation_jobs'],
+            filter='PartitionKey eq \'{}\''.format(pk))
+    except azure.common.AzureMissingResourceHttpError:
+        entities = []
+    return pk, entities
+
+
+def gc_federation_jobs(table_client, config, federation_id, fedhash):
+    # retrieve all job sequence rows for federation
+    pk, entities = get_all_federation_jobs(table_client, fedhash)
+    gc_dict = {
+        pk: []
+    }
+    # process all jobs
+    for entity in entities:
+        # if sequence exists, ask for confirmation
+        if ('Sequence' in entity and util.is_not_empty(entity['Sequence']) and
+                not util.confirm_action(
+                    config,
+                    msg=('destroying pending actions for job {} in '
+                         'federation id {}').format(
+                             entity['RowKey'], federation_id))):
+            raise RuntimeError(
+                'Not destroying federation job {} with pending actions '
+                'in federation id {}'.format(
+                    entity['RowKey'], federation_id))
+        gc_dict[pk].append(entity['RowKey'])
+        loc_pk, loc_rks = collate_all_location_entities_for_job(
+            table_client, fedhash, entity)
+        if util.is_not_empty(loc_rks) and not util.confirm_action(
+                config,
+                msg='orphan job {} in federation id {}'.format(
+                    entity['RowKey'], federation_id)):
+            raise RuntimeError(
+                'Not orphaning active/completed federation job '
+                '{} in federation id {}'.format(
+                    entity['RowKey'], federation_id))
+        gc_dict[loc_pk] = loc_rks
+    # batch delete entities
+    for gc_pk in gc_dict:
+        batch_delete_entities(
+            table_client, _STORAGE_CONTAINERS['table_federation_jobs'],
+            gc_pk, gc_dict[gc_pk])
+
+
 def destroy_federation_id(
-        blob_client, table_client, queue_client, federation_id):
+        blob_client, table_client, queue_client, config, federation_id):
     # type: (azure.storage.blob.BlockBlobService, azuretable.TableService,
-    #        azure.queue.QueueService, str) -> None
+    #        azure.queue.QueueService, dict, str) -> None
     """Remove storage containers for federation id
     :param azure.storage.blob.BlockBlobService blob_client: blob client
     :param azure.cosmosdb.table.TableService table_client: table client
     :param azure.storage.queue.QueueService queue_service: queue client
+    :param dict config: configuration dict
     :param str federation_id: federation id
     """
     fedhash = hash_federation_id(federation_id)
+    # delete table entities for federation id
+    logger.debug('deleting all federation {} job entities'.format(
+        federation_id))
+    gc_federation_jobs(table_client, config, federation_id, fedhash)
     # remove table entry for federation id
-    logger.debug('deleting federation {} entity to global table'.format(
+    logger.debug('deleting federation {} entities in global table'.format(
         federation_id))
     try:
         table_client.delete_entity(
             _STORAGE_CONTAINERS['table_federation_global'],
             _ALL_FEDERATIONS_PK, fedhash)
     except azure.common.AzureMissingResourceHttpError:
-        logger.error('federation id {} does not exist'.format(federation_id))
-        return
-    # delete blob container for federation id
-    contname = '{}-{}'.format(_STORAGE_CONTAINERS['blob_federation'], fedhash)
-    logger.debug('deleting container: {}'.format(contname))
-    blob_client.delete_container(contname)
+        pass
+    try:
+        fedentities = table_client.query_entities(
+            _STORAGE_CONTAINERS['table_federation_global'],
+            filter='PartitionKey eq \'{}\''.format(fedhash))
+    except azure.common.AzureMissingResourceHttpError:
+        pass
+    else:
+        batch_delete_entities(
+            table_client, _STORAGE_CONTAINERS['table_federation_global'],
+            fedhash, [x['RowKey'] for x in fedentities])
     # delete job queue for federation id
     contname = '{}-{}'.format(_STORAGE_CONTAINERS['queue_federation'], fedhash)
     logger.debug('deleting queue: {}'.format(contname))
     queue_client.delete_queue(contname)
+    # delete blob container for federation id
+    contname = '{}-{}'.format(_STORAGE_CONTAINERS['blob_federation'], fedhash)
+    logger.debug('deleting container: {}'.format(contname))
+    blob_client.delete_container(contname)
 
 
 def add_pool_to_federation(
@@ -791,7 +886,7 @@ def remove_pool_from_federation(
                 poolid, federation_id))
 
 
-def _retrieve_and_merge_sequence(table_client, pk, rk, unique_id):
+def _retrieve_and_merge_sequence(table_client, pk, rk, unique_id, kind):
     try:
         ent = table_client.get_entity(
             _STORAGE_CONTAINERS['table_federation_jobs'], pk, rk)
@@ -804,99 +899,137 @@ def _retrieve_and_merge_sequence(table_client, pk, rk, unique_id):
             'PartitionKey': pk,
             'RowKey': rk,
             'Sequence': str(unique_id),
+            'Kind': kind,
         }
     return ent
 
 
+def check_if_job_schedule_exists_in_federation(
+        table_client, federation_id, job_schedule_id):
+    fedhash = hash_federation_id(federation_id)
+    pk = '{}${}'.format(_FEDERATION_ACTIONS_PREFIX_PK, fedhash)
+    try:
+        table_client.get_entity(
+            _STORAGE_CONTAINERS['table_federation_jobs'], pk, job_schedule_id)
+        return True
+    except azure.common.AzureMissingResourceHttpError:
+        pass
+    return False
+
+
 def add_job_to_federation(
-        table_client, queue_client, federation_id, job_id, unique_id, msg):
+        table_client, queue_client, federation_id, unique_id, msg):
     # type: (azure.cosmosdb.TableService, azure.queue.QueueService, str,
-    #        str, uuid.UUID, dict) -> None
-    """Add a job to a federation
+    #        uuid.UUID, dict, str) -> None
+    """Add a job/job schedule to a federation
     :param azure.cosmosdb.table.TableService table_client: table client
     :param azure.storage.queue.QueueService queue_service: queue client
     :param str federation_id: federation id
-    :param str job_id: job or job schedule id
     :param uuid.UUID unique_id: unique id
     :param dict msg: dict payload
     """
     fedhash = hash_federation_id(federation_id)
     pk = '{}${}'.format(_FEDERATION_ACTIONS_PREFIX_PK, fedhash)
-    rk = job_id
+    kind = msg['action']['kind']
+    rk = msg[kind]['id']
     # upsert unique id to sequence
     while True:
-        entity = _retrieve_and_merge_sequence(table_client, pk, rk, unique_id)
+        entity = _retrieve_and_merge_sequence(
+            table_client, pk, rk, unique_id, kind)
         try:
             etag = table_client.insert_or_replace_entity(
                 _STORAGE_CONTAINERS['table_federation_jobs'], entity)
             logger.debug(
-                'upserted job {} sequence uid {} to federation {} '
-                'etag={}'.format(job_id, unique_id, federation_id, etag))
+                'upserted {} {} sequence uid {} to federation {} '
+                'etag={}'.format(kind, rk, unique_id, federation_id, etag))
             break
         except azure.common.AzureConflictHttpError:
             logger.debug(
-                'conflict upserting job {} sequence uid {} to '
-                'federation {}'.format(job_id, unique_id, federation_id))
+                'conflict upserting {} {} sequence uid {} to '
+                'federation {}'.format(kind, rk, unique_id, federation_id))
     # add queue message
-    msg_data = json.dumps(msg, ensure_ascii=True)
+    msg_data = json.dumps(msg, ensure_ascii=True, sort_keys=True)
     contname = '{}-{}'.format(
         _STORAGE_CONTAINERS['queue_federation'], fedhash)
     queue_client.put_message(contname, msg_data, time_to_live=-1)
 
 
 def delete_or_terminate_job_from_federation(
-        table_client, queue_client, delete, federation_id, unique_id,
-        job_id, job_schedule_id):
+        table_client, queue_client, delete, federation_id, job_id,
+        job_schedule_id, all_jobs, all_jobschedules):
     # type: (azure.cosmosdb.TableService, azure.queue.QueueService, bool, str,
-    #        uuid.UUID, str, str) -> None
+    #        str, str, bool, bool) -> None
     """Delete or terminate a job from a federation
     :param azure.cosmosdb.table.TableService table_client: table client
     :param azure.storage.queue.QueueService queue_service: queue client
     :param bool delete: delete instead of terminate
     :param str federation_id: federation id
-    :param uuid.UUID unique_id: unique id
     :param str job_id: job id
     :param str job_schedule_id: job schedule id
+    :param bool all_jobs: all jobs
+    :param bool all_jobschedules: all jobschedules
     """
     fedhash = hash_federation_id(federation_id)
-    pk = '{}${}'.format(_FEDERATION_ACTIONS_PREFIX_PK, fedhash)
-    target = job_id if util.is_not_empty(job_id) else job_schedule_id
-    # upsert unique id to sequence
-    while True:
-        entity = _retrieve_and_merge_sequence(
-            table_client, pk, target, unique_id)
-        try:
-            etag = table_client.insert_or_replace_entity(
-                _STORAGE_CONTAINERS['table_federation_jobs'], entity)
-            logger.debug(
-                'upserted job {} sequence uid {} to federation {} '
-                'etag={}'.format(job_id, unique_id, federation_id, etag))
-            break
-        except azure.common.AzureConflictHttpError:
-            logger.debug(
-                'conflict upserting job {} sequence uid {} to '
-                'federation {}'.format(job_id, unique_id, federation_id))
-    # add queue message
-    kind = 'job' if util.is_not_empty(job_id) else 'job_schedule'
-    method = 'delete' if delete else 'terminate'
-    msg = {
-        'version': '1',
-        'federation_id': federation_id,
-        'action': {
-            'method': method,
-            'kind': kind,
-        },
-        kind: {
-            'id': target,
-            'uuid': str(unique_id),
-        },
-    }
-    msg_data = json.dumps(msg, ensure_ascii=True)
-    contname = '{}-{}'.format(
-        _STORAGE_CONTAINERS['queue_federation'], fedhash)
-    queue_client.put_message(contname, msg_data, time_to_live=-1)
-    logger.debug('enqueued {} of {} {} for federation {}'.format(
-        method, kind, target, federation_id))
+    if all_jobs or all_jobschedules:
+        if all_jobs:
+            kind = 'job'
+        elif all_jobschedules:
+            kind = 'job_schedule'
+        targets = []
+        logger.debug('fetching all {}s for federation id {}'.format(
+            kind, federation_id))
+        pk, entities = get_all_federation_jobs(table_client, fedhash)
+        for entity in entities:
+            if entity['Kind'] == kind:
+                targets.append(entity['RowKey'])
+    else:
+        pk = '{}${}'.format(_FEDERATION_ACTIONS_PREFIX_PK, fedhash)
+        kind = 'job' if util.is_not_empty(job_id) else 'job_schedule'
+        targets = [job_id if util.is_not_empty(job_id) else job_schedule_id]
+    if len(targets) == 0:
+        logger.error(
+            'No {}s to {} in federation id {}'.format(
+                kind, 'delete' if delete else 'terminate', federation_id))
+        return
+    for target in targets:
+        unique_id = uuid.uuid4()
+        # upsert unique id to sequence
+        while True:
+            entity = _retrieve_and_merge_sequence(
+                table_client, pk, target, unique_id, kind)
+            try:
+                etag = table_client.insert_or_replace_entity(
+                    _STORAGE_CONTAINERS['table_federation_jobs'], entity)
+                logger.debug(
+                    'upserted {} {} sequence uid {} to federation {} '
+                    'etag={}'.format(
+                        kind, target, unique_id, federation_id, etag))
+                break
+            except azure.common.AzureConflictHttpError:
+                logger.debug(
+                    'conflict upserting {} {} sequence uid {} to '
+                    'federation {}'.format(
+                        kind, job_id, unique_id, federation_id))
+        # add queue message
+        method = 'delete' if delete else 'terminate'
+        msg = {
+            'version': '1',
+            'federation_id': federation_id,
+            'action': {
+                'method': method,
+                'kind': kind,
+            },
+            kind: {
+                'id': target,
+                'uuid': str(unique_id),
+            },
+        }
+        msg_data = json.dumps(msg, ensure_ascii=True, sort_keys=True)
+        contname = '{}-{}'.format(
+            _STORAGE_CONTAINERS['queue_federation'], fedhash)
+        queue_client.put_message(contname, msg_data, time_to_live=-1)
+        logger.debug('enqueued {} of {} {} for federation {}'.format(
+            method, kind, target, federation_id))
 
 
 def _check_file_and_upload(blob_client, file, key, container=None):
@@ -913,6 +1046,7 @@ def _check_file_and_upload(blob_client, file, key, container=None):
     upload = True
     # check if blob exists
     try:
+        print(contname, file[0])
         prop = blob_client.get_blob_properties(contname, file[0])
         if (prop.properties.content_settings.content_md5 ==
                 util.compute_md5_for_file(file[1], True)):
@@ -924,6 +1058,26 @@ def _check_file_and_upload(blob_client, file, key, container=None):
     if upload:
         logger.info('uploading file {} as {!r}'.format(file[1], file[0]))
         blob_client.create_blob_from_path(contname, file[0], str(file[1]))
+
+
+def delete_resource_file(blob_client, blob_name, federation_id=None):
+    # type: (azure.storage.blob.BlockBlobService, str) -> None
+    """Delete a resource file from blob storage
+    :param azure.storage.blob.BlockBlobService blob_client: blob client
+    :param str blob_name: blob name
+    :param str federation_id: federation id
+    """
+    if util.is_not_empty(federation_id):
+        fedhash = hash_federation_id(federation_id)
+        container = '{}-{}'.format(
+            _STORAGE_CONTAINERS['blob_federation'], fedhash)
+    else:
+        container = _STORAGE_CONTAINERS['blob_resourcefiles']
+    try:
+        blob_client.delete_blob(container, blob_name)
+    except azure.common.AzureMissingResourceHttpError:
+        logger.warning('blob {} does not exist in container {}'.format(
+            blob_name, container))
 
 
 def upload_resource_files(blob_client, files):
