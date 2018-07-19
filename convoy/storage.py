@@ -55,6 +55,8 @@ _MONITOR_BATCHPOOL_PK = 'BatchPool'
 _MONITOR_REMOTEFS_PK = 'RemoteFS'
 _ALL_FEDERATIONS_PK = '!!FEDERATIONS'
 _FEDERATION_ACTIONS_PREFIX_PK = '!!ACTIONS'
+_MAX_SEQUENCE_ID_PROPERTIES = 10
+_MAX_SEQUENCE_IDS_PER_PROPERTY = 975
 _DEFAULT_SAS_EXPIRY_DAYS = 365 * 30
 _STORAGEACCOUNT = None
 _STORAGEACCOUNTKEY = None
@@ -720,7 +722,8 @@ def gc_federation_jobs(table_client, config, federation_id, fedhash):
     # process all jobs
     for entity in entities:
         # if sequence exists, ask for confirmation
-        if ('Sequence' in entity and util.is_not_empty(entity['Sequence']) and
+        if ('Sequence0' in entity and
+                util.is_not_empty(entity['Sequence0']) and
                 not util.confirm_action(
                     config,
                     msg=('destroying pending actions for job {} in '
@@ -886,32 +889,53 @@ def remove_pool_from_federation(
                 poolid, federation_id))
 
 
+def _pack_sequences(ent, unique_id):
+    seq = []
+    for i in range(0, _MAX_SEQUENCE_ID_PROPERTIES):
+        prop = 'Sequence{}'.format(i)
+        if prop in ent and util.is_not_empty(ent[prop]):
+            seq.extend(ent[prop].split(','))
+    seq.append(str(unique_id))
+    if len(seq) > _MAX_SEQUENCE_IDS_PER_PROPERTY * _MAX_SEQUENCE_ID_PROPERTIES:
+        raise RuntimeError(
+            'maximum number of enqueued sequence ids reached, please allow '
+            'job actions to drain')
+    for i in range(0, _MAX_SEQUENCE_ID_PROPERTIES):
+        prop = 'Sequence{}'.format(i)
+        start = i * _MAX_SEQUENCE_IDS_PER_PROPERTY
+        end = start + _MAX_SEQUENCE_IDS_PER_PROPERTY
+        if end > len(seq):
+            end = len(seq)
+        if start < end:
+            ent[prop] = ','.join(seq[start:end])
+        else:
+            ent[prop] = None
+
+
 def _retrieve_and_merge_sequence(table_client, pk, rk, unique_id, kind):
     try:
         ent = table_client.get_entity(
             _STORAGE_CONTAINERS['table_federation_jobs'], pk, rk)
-        if util.is_not_empty(ent['Sequence']):
-            ent['Sequence'] = '{},{}'.format(ent['Sequence'], unique_id)
-        else:
-            ent['Sequence'] = str(unique_id)
     except azure.common.AzureMissingResourceHttpError:
         ent = {
             'PartitionKey': pk,
             'RowKey': rk,
-            'Sequence': str(unique_id),
             'Kind': kind,
         }
+    _pack_sequences(ent, unique_id)
     return ent
 
 
-def check_if_job_schedule_exists_in_federation(
-        table_client, federation_id, job_schedule_id):
+def check_if_job_exists_in_federation(
+        table_client, federation_id, job_id):
     fedhash = hash_federation_id(federation_id)
-    pk = '{}${}'.format(_FEDERATION_ACTIONS_PREFIX_PK, fedhash)
+    pk = '{}${}'.format(fedhash, job_id)
     try:
-        table_client.get_entity(
-            _STORAGE_CONTAINERS['table_federation_jobs'], pk, job_schedule_id)
-        return True
+        entities = table_client.query_entities(
+            _STORAGE_CONTAINERS['table_federation_jobs'],
+            filter='PartitionKey eq \'{}\''.format(pk))
+        for ent in entities:
+            return True
     except azure.common.AzureMissingResourceHttpError:
         pass
     return False
@@ -1075,6 +1099,8 @@ def delete_resource_file(blob_client, blob_name, federation_id=None):
         container = _STORAGE_CONTAINERS['blob_resourcefiles']
     try:
         blob_client.delete_blob(container, blob_name)
+        logger.debug('blob {} deleted from container {}'.format(
+            blob_name, container))
     except azure.common.AzureMissingResourceHttpError:
         logger.warning('blob {} does not exist in container {}'.format(
             blob_name, container))

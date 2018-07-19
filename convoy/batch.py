@@ -4080,14 +4080,14 @@ def _add_task_collection(batch_client, job_id, task_map):
 
 
 def _construct_task(
-        batch_client, blob_client, keyvault_client, config, bxfile,
-        bs, native, is_windows, tempdisk, allow_run_on_missing,
+        batch_client, blob_client, keyvault_client, config, federation_id,
+        bxfile, bs, native, is_windows, tempdisk, allow_run_on_missing,
         docker_missing_images, singularity_missing_images, cloud_pool,
         pool, jobspec, job_id, job_env_vars, task_map, existing_tasklist,
         reserved_task_id, lasttaskid, is_merge_task, uses_task_dependencies,
         on_task_failure, _task):
     # type: (batch.BatchServiceClient, azureblob.BlockBlobService,
-    #        azure.keyvault.KeyVaultClient, dict, tuple,
+    #        azure.keyvault.KeyVaultClient, dict, str, tuple,
     #        settings.BatchShipyardSettings, bool, bool, str, bool,
     #        list, list, batchmodels.CloudPool, settings.PoolSettings,
     #        dict, str, dict, dict, list, str, str, bool, bool,
@@ -4098,6 +4098,7 @@ def _construct_task(
     :param azure.storage.blob.BlockBlobService blob_client: blob client
     :param azure.keyvault.KeyVaultClient keyvault_client: keyvault client
     :param dict config: configuration dict
+    :param str federation_id: federation id
     :param tuple bxfile: blobxfer file
     :param settings.BatchShipyardSettings bs: batch shipyard settings
     :param bool native: native pool
@@ -4151,8 +4152,7 @@ def _construct_task(
     # get and create env var file
     sas_urls = None
     if util.is_not_empty(env_vars) or task.infiniband or task.gpu:
-        envfileloc = '{}taskrf-{}/{}{}'.format(
-            bs.storage_entity_prefix, job_id, task.id, task.envfile)
+        envfileloc = '{}/{}{}'.format(job_id, task.id, task.envfile)
         f = tempfile.NamedTemporaryFile(mode='wb', delete=False)
         fname = f.name
         try:
@@ -4184,8 +4184,12 @@ def _construct_task(
             # close and upload env var file
             f.close()
             if not native and not is_singularity:
-                sas_urls = storage.upload_resource_files(
-                    blob_client, [(envfileloc, fname)])
+                if util.is_none_or_empty(federation_id):
+                    sas_urls = storage.upload_resource_files(
+                        blob_client, [(envfileloc, fname)])
+                else:
+                    sas_urls = storage.upload_job_for_federation(
+                        blob_client, federation_id, [(envfileloc, fname)])
         finally:
             os.unlink(fname)
             del f
@@ -4543,7 +4547,10 @@ def add_jobs(
         uses_task_dependencies = False
         docker_missing_images = []
         singularity_missing_images = []
-        allow_run_on_missing = settings.job_allow_run_on_missing(jobspec)
+        allow_run_on_missing = (
+            True if util.is_not_empty(federation_id) else
+            settings.job_allow_run_on_missing(jobspec)
+        )
         existing_tasklist = None
         has_merge_task = settings.job_has_merge_task(jobspec)
         for task in settings.job_tasks(config, jobspec):
@@ -4937,18 +4944,20 @@ def add_jobs(
         task_map = {}
         for _task in settings.job_tasks(config, jobspec):
             existing_tasklist, lasttaskid = _construct_task(
-                batch_client, blob_client, keyvault_client, config, bxfile,
-                bs, native, is_windows, tempdisk, allow_run_on_missing,
-                docker_missing_images, singularity_missing_images, cloud_pool,
+                batch_client, blob_client, keyvault_client, config,
+                federation_id, bxfile, bs, native, is_windows, tempdisk,
+                allow_run_on_missing, docker_missing_images,
+                singularity_missing_images, cloud_pool,
                 pool, jobspec, job_id, job_env_vars, task_map,
                 existing_tasklist, reserved_task_id, lasttaskid, False,
                 uses_task_dependencies, on_task_failure, _task)
         if has_merge_task:
             _task = settings.job_merge_task(jobspec)
             existing_tasklist, merge_task_id = _construct_task(
-                batch_client, blob_client, keyvault_client, config, bxfile,
-                bs, native, is_windows, tempdisk, allow_run_on_missing,
-                docker_missing_images, singularity_missing_images, cloud_pool,
+                batch_client, blob_client, keyvault_client, config,
+                federation_id, bxfile, bs, native, is_windows, tempdisk,
+                allow_run_on_missing, docker_missing_images,
+                singularity_missing_images, cloud_pool,
                 pool, jobspec, job_id, job_env_vars, task_map,
                 existing_tasklist, reserved_task_id, lasttaskid, True,
                 uses_task_dependencies, on_task_failure, _task)
@@ -4971,7 +4980,6 @@ def add_jobs(
             # pickle and upload task map
             sas_url = pickle_and_upload(
                 blob_client, task_map, taskmaploc, federation_id=federation_id)
-            del taskmaploc
             # attach as resource file to jm task
             jobschedule.job_specification.job_manager_task.resource_files.\
                 append(
@@ -4992,7 +5000,7 @@ def add_jobs(
                     storage.delete_resource_file(blob_client, taskmaploc)
                     raise
             else:
-                if storage.check_if_job_schedule_exists_in_federation(
+                if storage.check_if_job_exists_in_federation(
                         table_client, federation_id, jobschedule.id):
                     # delete uploaded task map
                     storage.delete_resource_file(
@@ -5027,7 +5035,6 @@ def add_jobs(
                     jobschedule.id, unique_id)
                 sas_url = pickle_and_upload(
                     blob_client, info, jsloc, federation_id=federation_id)
-                del jsloc
                 # construct queue message
                 info = {
                     'version': '1',
@@ -5045,9 +5052,17 @@ def add_jobs(
                 # enqueue action to global queue
                 logger.debug('enqueuing action {} to federation {}'.format(
                     unique_id, federation_id))
-                storage.add_job_to_federation(
-                    table_client, queue_client, federation_id, unique_id, info)
-                del info
+                try:
+                    storage.add_job_to_federation(
+                        table_client, queue_client, federation_id, unique_id,
+                        info)
+                except Exception:
+                    # delete uploaded files
+                    storage.delete_resource_file(
+                        blob_client, taskmaploc, federation_id=federation_id)
+                    storage.delete_resource_file(
+                        blob_client, jsloc, federation_id=federation_id)
+                    raise
         else:
             # add task collection to job
             if util.is_none_or_empty(federation_id):
@@ -5090,7 +5105,6 @@ def add_jobs(
                 jloc = 'jobs/{}/{}.pickle'.format(job_id, unique_id)
                 sas_url = pickle_and_upload(
                     blob_client, info, jloc, federation_id=federation_id)
-                del jloc
                 # construct queue message
                 info = {
                     'version': '1',
@@ -5108,9 +5122,15 @@ def add_jobs(
                 # enqueue action to global queue
                 logger.debug('enqueuing action {} to federation {}'.format(
                     unique_id, federation_id))
-                storage.add_job_to_federation(
-                    table_client, queue_client, federation_id, unique_id, info)
-                del info
+                try:
+                    storage.add_job_to_federation(
+                        table_client, queue_client, federation_id, unique_id,
+                        info)
+                except Exception:
+                    # delete uploaded files
+                    storage.delete_resource_file(
+                        blob_client, jloc, federation_id=federation_id)
+                    raise
         tasksadded = True
     # tail file if specified
     if tail:

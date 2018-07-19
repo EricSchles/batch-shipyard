@@ -687,6 +687,8 @@ class FederationDataHandler():
     _GLOBAL_LOCK_BLOB = 'global.lock'
     _ALL_FEDERATIONS_PK = '!!FEDERATIONS'
     _FEDERATION_ACTIONS_PREFIX_PK = '!!ACTIONS'
+    _MAX_SEQUENCE_ID_PROPERTIES = 10
+    _MAX_SEQUENCE_IDS_PER_PROPERTY = 990
 
     def __init__(self, service_proxy: ServiceProxy) -> None:
         """Ctor for Federation data handler
@@ -751,16 +753,6 @@ class FederationDataHandler():
             self.service_proxy.table_name_global,
             filter='PartitionKey eq \'{}\''.format(fedhash))
 
-    def get_sequence_entity_for_job(
-            self,
-            fedhash: str,
-            job_id: str
-    ) -> azure.cosmosdb.table.Entity:
-        return self.service_proxy.table_client.get_entity(
-            self.service_proxy.table_name_jobs,
-            '{}${}'.format(self._FEDERATION_ACTIONS_PREFIX_PK, fedhash),
-            job_id)
-
     def generate_pk_rk_for_job_location_entity(
             self,
             fedhash: str,
@@ -784,6 +776,21 @@ class FederationDataHandler():
                 self.service_proxy.table_name_jobs, pk, rk)
         except azure.common.AzureMissingResourceHttpError:
             return None
+
+    def location_entities_exist_for_job(
+            self,
+            fedhash: str,
+            job_id: str,
+    ) -> bool:
+        try:
+            entities = self.service_proxy.table_client.query_entities(
+                self.service_proxy.table_name_jobs,
+                filter='PartitionKey eq \'{}${}\''.format(fedhash, job_id))
+            for ent in entities:
+                return True
+        except azure.common.AzureMissingResourceHttpError:
+            pass
+        return False
 
     def upsert_location_entity_for_job(
             self,
@@ -816,6 +823,17 @@ class FederationDataHandler():
         except azure.common.AzureMissingResourceHttpError:
             return None
 
+    def delete_action_entity_for_job(
+            self,
+            entity: Dict[str, Any],
+    ) -> None:
+        try:
+            self.service_proxy.table_client.delete_entity(
+                self.service_proxy.table_name_jobs, entity['PartitionKey'],
+                entity['RowKey'], if_match=entity['etag'])
+        except azure.common.AzureMissingResourceHttpError:
+            pass
+
     def get_messages_from_federation_queue(
             self,
             fedhash: str
@@ -826,14 +844,52 @@ class FederationDataHandler():
         return self.service_proxy.queue_client.get_messages(
             queue_name, num_messages=32, visibility_timeout=1)
 
-    def _retrieve_and_pop_sequence(self, fedhash, job_id):
-        ent = self.get_sequence_entity_for_job(fedhash, job_id)
-        seq = ent['Sequence'].split(',')
-        seq.pop(0)
-        ent['Sequence'] = ','.join(seq)
-        return ent
+    def _get_sequence_entity_for_job(
+            self,
+            fedhash: str,
+            job_id: str
+    ) -> azure.cosmosdb.table.Entity:
+        return self.service_proxy.table_client.get_entity(
+            self.service_proxy.table_name_jobs,
+            '{}${}'.format(self._FEDERATION_ACTIONS_PREFIX_PK, fedhash),
+            job_id)
 
-    def dequeue_unique_id_from_federation_sequence(
+    def get_first_sequence_id_for_job(
+            self,
+            fedhash: str,
+            job_id: str
+    ) -> str:
+        entity = self._get_sequence_entity_for_job(fedhash, job_id)
+        try:
+            return entity['Sequence0'].split(',')[0]
+        except Exception:
+            return None
+
+    def pop_and_pack_sequence_ids_for_job(
+            self,
+            fedhash: str,
+            job_id: str,
+    ) -> azure.cosmosdb.table.Entity:
+        entity = self._get_sequence_entity_for_job(fedhash, job_id)
+        seq = []
+        for i in range(0, self._MAX_SEQUENCE_ID_PROPERTIES):
+            prop = 'Sequence{}'.format(i)
+            if prop in entity and is_not_empty(entity[prop]):
+                seq.extend(entity[prop].split(','))
+        seq.pop(0)
+        for i in range(0, self._MAX_SEQUENCE_ID_PROPERTIES):
+            prop = 'Sequence{}'.format(i)
+            start = i * self._MAX_SEQUENCE_IDS_PER_PROPERTY
+            end = start + self._MAX_SEQUENCE_IDS_PER_PROPERTY
+            if end > len(seq):
+                end = len(seq)
+            if start < end:
+                entity[prop] = ','.join(seq[start:end])
+            else:
+                entity[prop] = None
+        return entity, len(seq) == 0
+
+    def dequeue_sequence_id_from_federation_sequence(
             self,
             fedhash: str,
             msg_id: str,
@@ -843,14 +899,27 @@ class FederationDataHandler():
         # pop first item off table sequence
         if is_not_empty(target):
             while True:
-                entity = self._retrieve_and_pop_sequence(fedhash, target)
+                entity, empty_seq = self.pop_and_pack_sequence_ids_for_job(
+                    fedhash, target)
+                # see if there are no job location entities
+                if (empty_seq and not self.location_entities_exist_for_job(
+                        fedhash, target)):
+                    delete = True
+                else:
+                    delete = False
                 try:
-                    etag = self.service_proxy.table_client.\
-                        insert_or_replace_entity(
-                            self.service_proxy.table_name_jobs, entity)
-                    logger.debug(
-                        'upserted target {} sequence to federation {} '
-                        'etag={}'.format(target, fedhash, etag))
+                    if delete:
+                        self.delete_action_entity_for_job(entity)
+                        logger.debug(
+                            'deleted target {} action entity from '
+                            'federation {}'.format(target, fedhash))
+                    else:
+                        etag = self.service_proxy.table_client.\
+                            insert_or_replace_entity(
+                                self.service_proxy.table_name_jobs, entity)
+                        logger.debug(
+                            'upserted target {} sequence to federation {} '
+                            'etag={}'.format(target, fedhash, etag))
                     break
                 except azure.common.AzureConflictHttpError:
                     logger.debug(
@@ -1388,12 +1457,14 @@ class FederationProcessor():
 
     async def add_job_schedule_v1(
             self, fedhash, job_schedule, constraints, unique_id):
-        # get the number of tasks in job
-        # try to match the appropriate pool for the tasks in job
-        # add job to pool
-        # if job exists, ensure settings match
-        # add tasks to job
-        # record mapping in fedjobs table
+        # ensure there is no existing job schedule. although this is checked
+        # at submission time, a similarly named job schedule can be enqueued
+        # multiple times before the action is dequeued
+        if self.fdh.location_entities_exist_for_job(fedhash, job_schedule.id):
+            logger.error(
+                'job schedule {} already exists for fed {} uid={}'.format(
+                    job_schedule.id, fedhash, unique_id))
+            return
         num_tasks = constraints['tasks_per_recurrence']
         logger.debug(
             'attempting to match job schedule {} with {} tasks in fed {} '
@@ -1539,18 +1610,17 @@ class FederationProcessor():
         unique_id = msg[target_type]['uuid']
         job_id = msg[target_type]['id']
         # get sequence from table
-        entity = self.fdh.get_sequence_entity_for_job(fedhash, job_id)
-        seq = entity['Sequence'].split(',')
-        if len(seq) < 1:
+        seq_id = self.fdh.get_first_sequence_id_for_job(fedhash, job_id)
+        if seq_id is None:
             logger.error(
                 'sequence length is non-positive for federation {}'.format(
                     fedhash))
             return True, None
-        if seq[0] != unique_id:
+        if seq_id != unique_id:
             logger.warning(
                 'skipping queue message for fed {} that does not match first '
                 'sequence q:{} != t:{} for job {}'.format(
-                    fedhash, unique_id, seq[0], job_id))
+                    fedhash, unique_id, seq_id, job_id))
             return False, None
         job_data = None
         # retrieve job/task data
@@ -1589,7 +1659,7 @@ class FederationProcessor():
                     target = None
                 # delete message
                 if del_msg:
-                    self.fdh.dequeue_unique_id_from_federation_sequence(
+                    self.fdh.dequeue_sequence_id_from_federation_sequence(
                         fedhash, msg.id, msg.pop_receipt, target)
         finally:
             self.federations[fedhash].lock.release()
