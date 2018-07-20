@@ -34,8 +34,10 @@ import json
 import logging
 import logging.handlers
 import multiprocessing
+import pathlib
 import pickle
 import random
+import subprocess
 import threading
 from typing import (
     Any,
@@ -71,8 +73,9 @@ def _setup_logger() -> None:
     logger.setLevel(logging.DEBUG)
     handler = logging.StreamHandler()
     formatter = logging.Formatter(
-        '%(asctime)sZ %(levelname)s %(name)s:%(funcName)s:%(lineno)d '
+        '%(asctime)s %(levelname)s %(name)s:%(funcName)s:%(lineno)d '
         '%(message)s')
+    formatter.default_msec_format = '%s.%03d'
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 
@@ -234,14 +237,15 @@ class ServiceProxy():
         """Ctor for ServiceProxy
         :param config: configuration
         """
-        self._batch_client_lock = threading.Lock()
-        self.batch_clients = {}
-        self.batch_shipyard_version = config['batch_shipyard']['version']
+        self._config = config
         prefix = config['storage']['entity_prefix']
         self.queue_prefix = '{}fed'.format(prefix)
         self.table_name_global = '{}fedglobal'.format(prefix)
         self.table_name_jobs = '{}fedjobs'.format(prefix)
         self.blob_container_name_global = '{}fedglobal'.format(prefix)
+        self.file_share_logging = '{}fedlogs'.format(prefix)
+        self._batch_client_lock = threading.Lock()
+        self.batch_clients = {}
         # create credentials
         self.creds = Credentials(config)
         # create clients
@@ -251,6 +255,30 @@ class ServiceProxy():
         self.queue_client = self._create_queue_client()
         logger.debug('created storage clients for storage account {}'.format(
             self.creds.storage_account))
+
+    @property
+    def batch_shipyard_version(self) -> str:
+        return self._config['batch_shipyard']['version']
+
+    @property
+    def batch_shipyard_var_path(self) -> pathlib.Path:
+        return pathlib.Path(self._config['batch_shipyard']['var_path'])
+
+    @property
+    def storage_entity_prefix(self) -> str:
+        return self._config['storage']['entity_prefix']
+
+    @property
+    def logger_level(self) -> str:
+        return self._config['logging']['level']
+
+    @property
+    def logger_persist(self) -> bool:
+        return self._config['logging']['persistence']
+
+    def log_configuration(self) -> None:
+        logger.debug('configuration: {}'.format(
+            json.dumps(self._config, sort_keys=True, indent=4)))
 
     def _modify_client_for_retry_and_user_agent(self, client: Any) -> None:
         """Extend retry policy of clients and add user agent string
@@ -735,6 +763,78 @@ class FederationDataHandler():
                     self._GLOBAL_LOCK_BLOB, self.lease_id)
             except azure.common.AzureConflictHttpError:
                 self.lease_id = None
+
+    def mount_file_storage(self) -> Optional[pathlib.Path]:
+        if not self.service_proxy.logger_persist:
+            logger.warning('logging persistence is disabled')
+            return None
+        # create logs directory
+        log_path = self.service_proxy.batch_shipyard_var_path / 'logs'
+        log_path.mkdir(exist_ok=True)
+        # mount
+        cmd = (
+            'mount -t cifs //{sa}.file.{ep}/{share} {hmp} -o '
+            'vers=3.0,username={sa},password={sakey},_netdev,serverino'
+        ).format(
+            sa=self.service_proxy.creds.storage_account,
+            ep=self.service_proxy.creds.storage_account_ep,
+            share=self.service_proxy.file_share_logging,
+            hmp=log_path,
+            sakey=self.service_proxy.creds.storage_account_key,
+        )
+        logger.debug('attempting to mount file share for logging persistence')
+        output = subprocess.check_output(
+            cmd, shell=True, stderr=subprocess.PIPE)
+        logger.debug(output)
+        return log_path
+
+    def unmount_file_storage(self) -> None:
+        if not self.service_proxy.logger_persist:
+            return
+        log_path = self.service_proxy.batch_shipyard_var_path / 'logs'
+        cmd = 'umount {hmp}'.format(hmp=log_path)
+        logger.debug(
+            'attempting to unmount file share for logging persistence')
+        output = subprocess.check_output(
+            cmd, shell=True, stderr=subprocess.PIPE)
+        logger.debug(output)
+
+    def set_log_configuration(self, log_path: pathlib.Path) -> None:
+        global logger
+        # remove existing handlers
+        handlers = logger.handlers[:]
+        for handler in handlers:
+            handler.close()
+            logger.removeHandler(handler)
+        # set level
+        if self.service_proxy.logger_level == 'info':
+            logger.setLevel(logging.INFO)
+        elif self.service_proxy.logger_level == 'warning':
+            logger.setLevel(logging.WARNING)
+        elif self.service_proxy.logger_level == 'error':
+            logger.setLevel(logging.ERROR)
+        elif self.service_proxy.logger_level == 'critical':
+            logger.setLevel(logging.CRITICAL)
+        else:
+            logger.setLevel(logging.DEBUG)
+        # set formatter
+        formatter = logging.Formatter(
+            '%(asctime)s %(levelname)s %(name)s:%(funcName)s:%(lineno)d '
+            '%(message)s')
+        formatter.default_msec_format = '%s.%03d'
+        # set handlers
+        handler_stream = logging.StreamHandler()
+        handler_stream.setFormatter(formatter)
+        logger.addHandler(handler_stream)
+        # set log file
+        if log_path is None:
+            logger.warning('not setting logfile as persistence is disabled')
+        else:
+            logfile = log_path / 'fedproxy.log'
+            handler_logfile = logging.handlers.RotatingFileHandler(
+                str(logfile), maxBytes=33554432, encoding='utf-8')
+            handler_logfile.setFormatter(formatter)
+            logger.addHandler(handler_logfile)
 
     def get_all_federations(self) -> List[azure.cosmosdb.table.Entity]:
         """Get all federations"""
@@ -1372,8 +1472,16 @@ class FederationProcessor():
         :param config: configuration
         """
         self._service_proxy = ServiceProxy(config)
-        self.fed_refresh_interval = config.get(
-            'federation_refresh_interval', 30)
+        try:
+            self.fed_refresh_interval = int(config['refresh_intervals'].get(
+                'federations', 30))
+        except KeyError:
+            self.fed_refresh_interval = 30
+        try:
+            self.job_refresh_interval = int(config['refresh_intervals'].get(
+                'jobs', 5))
+        except KeyError:
+            self.job_refresh_interval = 5
         self.csh = ComputeServiceHandler(self._service_proxy)
         self.bsh = BatchServiceHandler(self._service_proxy)
         self.fdh = FederationDataHandler(self._service_proxy)
@@ -1684,7 +1792,7 @@ class FederationProcessor():
                 # TODO process in parallel
                 for fedhash in self.federations:
                     await self.process_federation_queue(fedhash)
-            await asyncio.sleep(5)
+            await asyncio.sleep(self.job_refresh_interval)
 
     async def poll_for_federations(
         self,
@@ -1693,12 +1801,21 @@ class FederationProcessor():
         """Poll federations
         :param loop: asyncio loop
         """
-        logger.debug('polling federation table {} every {} sec'.format(
-            self._service_proxy.table_name_global, self.fed_refresh_interval))
         # lease global lock blob
         self.fdh.lease_global_lock(loop)
+        # mount log storage
+        log_path = self.fdh.mount_file_storage()
+        # set logging configuration
+        self.fdh.set_log_configuration(log_path)
+        self._service_proxy.log_configuration()
+        logger.debug('polling federation table {} every {} sec'.format(
+            self._service_proxy.table_name_global, self.fed_refresh_interval))
+        logger.debug('polling jobs table {} every {} sec'.format(
+            self._service_proxy.table_name_jobs, self.job_refresh_interval))
+        # begin message processing
         asyncio.ensure_future(
             self.iterate_and_process_federation_queues(), loop=loop)
+        # continuously update federations
         while True:
             if not await self.check_global_lock():
                 continue
@@ -1715,14 +1832,26 @@ def main() -> None:
         raise ValueError('config file not specified')
     with open(args.conf, 'rb') as f:
         config = json.load(f)
-    logger.debug('loaded config: {}'.format(config))
+    logger.debug('loaded config from {}: {}'.format(args.conf, config))
     # create federation processor
     fed_processor = FederationProcessor(config)
     # run the poller
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(
-        fed_processor.poll_for_federations(loop)
-    )
+    try:
+        loop.run_until_complete(
+            fed_processor.poll_for_federations(loop)
+        )
+    except Exception as exc:
+        logger.exception(str(exc))
+    finally:
+        handlers = logger.handlers[:]
+        for handler in handlers:
+            handler.close()
+            logger.removeHandler(handler)
+        try:
+            fed_processor.fdh.unmount_file_storage()
+        except Exception as exc:
+            logger.exception(str(exc))
 
 
 def parseargs():

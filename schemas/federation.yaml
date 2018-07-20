@@ -89,3 +89,21 @@ mapping:
         required: true
       accelerated_networking:
         type: bool
+      proxy_options:
+        type: map
+        mapping:
+          polling_interval:
+            type: map
+            mapping:
+              federations:
+                type: int
+              jobs:
+                type: int
+          logging:
+            type: map
+            mapping:
+              persistence:
+                type: bool
+              level:
+                type: str
+                enum: ['debug', 'info', 'warning', 'error', 'critical']

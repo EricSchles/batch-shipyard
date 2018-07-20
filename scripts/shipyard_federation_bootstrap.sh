@@ -56,20 +56,24 @@ fi
 
 # globals
 aad_cloud=
+log_level="debug"
+log_persist="true"
 prefix=
-refresh_interval=30
+federation_refresh_interval=30
+jobs_refresh_interval=5
 storage_account=
 storage_rg=
 shipyardversion=
 
 # process command line options
-while getopts "h?a:r:s:v:" opt; do
+while getopts "h?a:l:r:s:v:" opt; do
     case "$opt" in
         h|\?)
             echo "shipyard_federation_bootstrap.sh parameters"
             echo ""
             echo "-a [aad cloud type] AAD cloud type for MSI"
-            echo "-r [interval] federation refresh interval"
+            echo "-l [persistence:level] logging options"
+            echo "-r [federation:jobs] refresh intervals"
             echo "-s [storage account:resource group:prefix] storage config"
             echo "-v [version] batch-shipyard version"
             echo ""
@@ -78,8 +82,15 @@ while getopts "h?a:r:s:v:" opt; do
         a)
             aad_cloud=${OPTARG,,}
             ;;
+        l)
+            IFS=':' read -ra lo <<< "${OPTARG,,}"
+            log_persist=${lo[0]}
+            log_level=${lo[1]}
+            ;;
         r)
-            refresh_interval=${OPTARG}
+            IFS=':' read -ra ri <<< "${OPTARG,,}"
+            federation_refresh_interval=${ri[0]}
+            jobs_refresh_interval=${ri[1]}
             ;;
         s)
             IFS=':' read -ra ss <<< "${OPTARG,,}"
@@ -227,9 +238,17 @@ cat > ${SHIPYARD_CONF_FILE} << EOF
         "entity_prefix": "$prefix"
     },
     "batch_shipyard": {
+        "var_path": "$SHIPYARD_VAR_DIR",
         "version": "$shipyardversion"
     },
-    "federation_refresh_interval": $refresh_interval
+    "logging": {
+        "persistence": $log_persist,
+        "level": "$log_level"
+    },
+    "refresh_intervals": {
+        "federations": $federation_refresh_interval,
+        "jobs": $jobs_refresh_interval
+    }
 }
 EOF
     log INFO "Batch Shipyard federation config created"
@@ -327,8 +346,9 @@ echo "--------------"
 echo "OS Distribution: $DISTRIB_ID $DISTRIB_RELEASE"
 echo "Batch Shipyard version: $shipyardversion"
 echo "AAD cloud: $aad_cloud"
-echo "Federation refresh interval: $refresh_interval"
 echo "Storage: $storage_account:$storage_rg:$prefix"
+echo "Refresh intervals: feds=$federation_refresh_interval jobs=$jobs_refresh_interval"
+echo "Logging: persist=$log_persist level=$log_level"
 echo ""
 
 # check sdb1 mount

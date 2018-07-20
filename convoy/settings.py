@@ -333,6 +333,11 @@ ResourceFileSettings = collections.namedtuple(
         'file_path', 'blob_source', 'file_mode',
     ]
 )
+CustomMountFstabSettings = collections.namedtuple(
+    'CustomMountFstabSettings', [
+        'fs_spec', 'fs_vfstype', 'fs_mntops', 'fs_freq', 'fs_passno',
+    ]
+)
 ManagedDisksSettings = collections.namedtuple(
     'ManagedDisksSettings', [
         'location', 'resource_group', 'premium', 'disk_size_gb', 'disk_names',
@@ -409,9 +414,10 @@ MonitoringVmSettings = collections.namedtuple(
         'accelerated_networking',
     ]
 )
-CustomMountFstabSettings = collections.namedtuple(
-    'CustomMountFstabSettings', [
-        'fs_spec', 'fs_vfstype', 'fs_mntops', 'fs_freq', 'fs_passno',
+FederationProxyOptionsSettings = collections.namedtuple(
+    'FederationProxyOptionsSettings', [
+        'federations_polling_interval', 'jobs_polling_interval',
+        'log_persistence', 'log_level',
     ]
 )
 
@@ -4427,6 +4433,27 @@ def monitoring_settings(config):
             hpn_server_swap=False,
             allow_docker_access=False,
         ),
+    )
+
+
+def federation_proxy_options_settings(config):
+    # type: (dict) -> FederationProxyOptionsSettings
+    """Get federation proxy options settings
+    :param dict config: configuration dict
+    :rtype: FederationProxyOptionsSettings
+    :return: federation proxy options settings
+    """
+    try:
+        conf = config['federation']['proxy_options']
+    except KeyError:
+        conf = {}
+    pi_conf = _kv_read_checked(conf, 'polling_interval', default={})
+    log_conf = _kv_read_checked(conf, 'logging', default={})
+    return FederationProxyOptionsSettings(
+        federations_polling_interval=str(_kv_read(pi_conf, 'federations', 30)),
+        jobs_polling_interval=str(_kv_read(pi_conf, 'jobs', 5)),
+        log_persistence=_kv_read(log_conf, 'persistence', True),
+        log_level=_kv_read_checked(log_conf, 'level', 'debug'),
     )
 
 

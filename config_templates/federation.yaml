@@ -31,3 +31,10 @@ federation:
         - 5.6.7.0/24
   vm_size: STANDARD_D2_V2
   accelerated_networking: false
+  proxy_options:
+    polling_interval:
+      federations: 15
+      jobs: 5
+    logging:
+      persistence: true
+      level: debug

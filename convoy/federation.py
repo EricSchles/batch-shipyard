@@ -78,6 +78,7 @@ def _create_virtual_machine_extension(
     :return: msrestazure.azure_operation.AzureOperationPoller
     """
     bs = settings.batch_shipyard_settings(config)
+    fpo = settings.federation_proxy_options_settings(config)
     # construct vm extensions
     vm_ext_name = settings.generate_virtual_machine_extension_name(
         vm_resource, offset)
@@ -85,10 +86,12 @@ def _create_virtual_machine_extension(
     ssel = settings.batch_shipyard_settings(config).storage_account_settings
     rg = settings.credentials_storage(config, ssel).resource_group
     # construct bootstrap command
-    cmd = './{bsf}{a}{r}{s}{v}'.format(
+    cmd = './{bsf}{a}{log}{r}{s}{v}'.format(
         bsf=bootstrap_file[0],
         a=' -a {}'.format(settings.determine_cloud_type_from_aad(config)),
-        r=' -r 15', # TODO refresh interval config
+        log=' -l {}:{}'.format(fpo.log_persistence, fpo.log_level),
+        r=' -r {}:{}'.format(
+            fpo.federations_polling_interval, fpo.jobs_polling_interval),
         s=' -s {}:{}:{}'.format(
             storage.get_storageaccount(),
             rg if util.is_not_empty(rg) else '',
@@ -178,9 +181,20 @@ def create_federation_proxy(
     # create resource group if it doesn't exist
     resource.create_resource_group(
         resource_client, fs.resource_group, fs.location)
-    # create storage container
+    # create storage containers
     storage.create_storage_containers_nonbatch(
         blob_client, table_client, queue_client, 'federation')
+    # create file share for log persistence
+    bs = settings.batch_shipyard_settings(config)
+    storage.create_file_share_saskey(
+        settings.credentials_storage(
+            config,
+            bs.storage_account_settings,
+        ),
+        '{}fedlogs'.format(bs.storage_entity_prefix),
+        'ingress',
+        create_share=True,
+    )
     # create global lock
     storage.create_global_lock_blob(blob_client, 'federation')
     # upload scripts to blob storage for customscript vm extension
