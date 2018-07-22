@@ -35,7 +35,9 @@ import hashlib
 import json
 import logging
 import os
+import pickle
 import re
+import tempfile
 import uuid
 # non-stdlib imports
 import azure.common
@@ -1044,7 +1046,8 @@ def check_if_job_exists_in_federation(
 
 
 def add_job_to_federation(
-        table_client, queue_client, federation_id, unique_id, msg):
+        table_client, queue_client, federation_id, unique_id, msg,
+        kind):
     # type: (azure.cosmosdb.TableService, azure.queue.QueueService, str,
     #        uuid.UUID, dict, str) -> None
     """Add a job/job schedule to a federation
@@ -1053,11 +1056,11 @@ def add_job_to_federation(
     :param str federation_id: federation id
     :param uuid.UUID unique_id: unique id
     :param dict msg: dict payload
+    :param str kind: kind
     """
     fedhash = hash_federation_id(federation_id)
     pk = '{}${}'.format(_FEDERATION_ACTIONS_PREFIX_PK, fedhash)
-    kind = msg['action']['kind']
-    rk = msg[kind]['id']
+    rk = msg['target']
     # upsert unique id to sequence
     while True:
         entity = _retrieve_and_merge_sequence(
@@ -1173,12 +1176,48 @@ def list_jobs_in_federation(
                     federation_id))
 
 
+def pickle_and_upload(blob_client, data, rpath, federation_id=None):
+    # type: (azureblob.BlockBlobService, dict, str, str) -> str
+    """Pickle and upload data to a given remote path
+    :param azure.storage.blob.BlockBlobService blob_client: blob client
+    :param dict data: data to pickle
+    :param str rpath: remote path
+    :param str federation_id: federation id
+    :rtype: str
+    :return: sas url of uploaded pickle
+    """
+    f = tempfile.NamedTemporaryFile(mode='wb', delete=False)
+    fname = f.name
+    try:
+        with open(fname, 'wb') as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        f.close()
+        if util.is_none_or_empty(federation_id):
+            sas_urls = upload_resource_files(blob_client, [(rpath, fname)])
+        else:
+            sas_urls = upload_job_for_federation(
+                blob_client, federation_id, [(rpath, fname)])
+        if len(sas_urls) != 1:
+            raise RuntimeError(
+                'unexpected number of sas urls for pickled upload')
+        return next(iter(sas_urls.values()))
+    finally:
+        try:
+            os.unlink(fname)
+        except OSError:
+            pass
+        del f
+        del fname
+
+
 def delete_or_terminate_job_from_federation(
-        table_client, queue_client, delete, federation_id, job_id,
+        blob_client, table_client, queue_client, delete, federation_id, job_id,
         job_schedule_id, all_jobs, all_jobschedules):
-    # type: (azure.cosmosdb.TableService, azure.queue.QueueService, bool, str,
-    #        str, str, bool, bool) -> None
+    # type: (azure.storage.blob.BlockBlobService, azure.cosmosdb.TableService,
+    #        azure.queue.QueueService, bool, str, str, str, bool,
+    #        bool) -> None
     """Delete or terminate a job from a federation
+    :param azure.storage.blob.BlockBlobService blob_client: blob client
     :param azure.cosmosdb.table.TableService table_client: table client
     :param azure.storage.queue.QueueService queue_service: queue client
     :param bool delete: delete instead of terminate
@@ -1205,13 +1244,28 @@ def delete_or_terminate_job_from_federation(
         pk = '{}${}'.format(_FEDERATION_ACTIONS_PREFIX_PK, fedhash)
         kind = 'job' if util.is_not_empty(job_id) else 'job_schedule'
         targets = [job_id if util.is_not_empty(job_id) else job_schedule_id]
+    method = 'delete' if delete else 'terminate'
     if len(targets) == 0:
         logger.error(
             'no {}s to {} in federation id {}'.format(
-                kind, 'delete' if delete else 'terminate', federation_id))
+                kind, method, federation_id))
         return
     for target in targets:
         unique_id = uuid.uuid4()
+        rpath = 'messages/{}.pickle'.format(unique_id)
+        # upload message data to blob
+        info = {
+            'version': '1',
+            'action': {
+                'method': method,
+                'kind': kind,
+            },
+            kind: {
+                'id': target,
+            },
+        }
+        sas_url = pickle_and_upload(
+            blob_client, info, rpath, federation_id=federation_id)
         # upsert unique id to sequence
         while True:
             entity = _retrieve_and_merge_sequence(
@@ -1230,18 +1284,12 @@ def delete_or_terminate_job_from_federation(
                     'federation {}'.format(
                         kind, job_id, unique_id, federation_id))
         # add queue message
-        method = 'delete' if delete else 'terminate'
         msg = {
             'version': '1',
             'federation_id': federation_id,
-            'action': {
-                'method': method,
-                'kind': kind,
-            },
-            kind: {
-                'id': target,
-                'uuid': str(unique_id),
-            },
+            'target': target,
+            'blob_data': sas_url,
+            'uuid': str(unique_id),
         }
         msg_data = json.dumps(msg, ensure_ascii=True, sort_keys=True)
         contname = '{}-{}'.format(

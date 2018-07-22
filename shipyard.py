@@ -2424,22 +2424,29 @@ def fed(ctx):
     pass
 
 
-@fed.command('create')
+@fed.group()
+@pass_cli_context
+def proxy(ctx):
+    """Federation proxy actions"""
+    pass
+
+
+@proxy.command('create')
 @common_options
 @federation_options
 @keyvault_options
 @aad_options
 @pass_cli_context
-def fed_create(ctx):
+def fed_proxy_create(ctx):
     """Create a federation proxy"""
     ctx.initialize_for_federation()
-    convoy.fleet.action_fed_create(
+    convoy.fleet.action_fed_proxy_create(
         ctx.auth_client, ctx.resource_client, ctx.compute_client,
         ctx.network_client, ctx.blob_client, ctx.table_client,
         ctx.queue_client, ctx.config)
 
 
-@fed.command('ssh')
+@proxy.command('ssh')
 @click.option(
     '--tty', is_flag=True, help='Allocate a pseudo-tty')
 @common_options
@@ -2448,15 +2455,15 @@ def fed_create(ctx):
 @keyvault_options
 @aad_options
 @pass_cli_context
-def fed_ssh(ctx, tty, command):
+def fed_proxy_ssh(ctx, tty, command):
     """Interactively login via SSH to federation proxy virtual
     machine in Azure"""
     ctx.initialize_for_federation()
-    convoy.fleet.action_fed_ssh(
+    convoy.fleet.action_fed_proxy_ssh(
         ctx.compute_client, ctx.network_client, ctx.config, tty, command)
 
 
-@fed.command('destroy')
+@proxy.command('destroy')
 @click.option(
     '--delete-resource-group', is_flag=True,
     help='Delete all resources in the federation resource group')
@@ -2472,41 +2479,34 @@ def fed_ssh(ctx, tty, command):
 @keyvault_options
 @aad_options
 @pass_cli_context
-def fed_destroy(
+def fed_proxy_destroy(
         ctx, delete_resource_group, delete_virtual_network,
         generate_from_prefix, no_wait):
     """Destroy a federation proxy"""
     ctx.initialize_for_federation()
-    convoy.fleet.action_fed_destroy(
+    convoy.fleet.action_fed_proxy_destroy(
         ctx.resource_client, ctx.compute_client, ctx.network_client,
         ctx.blob_client, ctx.table_client, ctx.queue_client, ctx.config,
         delete_resource_group, delete_virtual_network, generate_from_prefix,
         not no_wait)
 
 
-@fed.group()
-@pass_cli_context
-def id(ctx):
-    """Federation ID actions"""
-    pass
-
-
-@id.command('create')
+@fed.command('create')
 @click.argument('federation-id')
 @common_options
 @federation_options
 @keyvault_options
 @aad_options
 @pass_cli_context
-def fed_id_create(ctx, federation_id):
-    """Create a federation id"""
+def fed_create(ctx, federation_id):
+    """Create a federation"""
     ctx.initialize_for_federation()
-    convoy.fleet.action_fed_id_create(
+    convoy.fleet.action_fed_create(
         ctx.blob_client, ctx.table_client, ctx.queue_client, ctx.config,
         federation_id)
 
 
-@id.command('list')
+@fed.command('list')
 @click.option(
     '--federation-id', multiple=True, help='Limit to specified federation id')
 @common_options
@@ -2514,14 +2514,14 @@ def fed_id_create(ctx, federation_id):
 @keyvault_options
 @aad_options
 @pass_cli_context
-def fed_id_list(ctx, federation_id):
+def fed_list(ctx, federation_id):
     """List all federations"""
     ctx.initialize_for_federation()
-    convoy.fleet.action_fed_id_list(
+    convoy.fleet.action_fed_list(
         ctx.table_client, ctx.config, federation_id)
 
 
-@id.command('add')
+@fed.command('add')
 @click.argument('federation-id')
 @click.option(
     '--batch-service-url',
@@ -2533,14 +2533,14 @@ def fed_id_list(ctx, federation_id):
 @keyvault_options
 @aad_options
 @pass_cli_context
-def fed_id_add(ctx, federation_id, batch_service_url, poolid):
+def fed_add(ctx, federation_id, batch_service_url, poolid):
     """Add a pool to a federation"""
     ctx.initialize_for_federation()
-    convoy.fleet.action_fed_id_add_pool(
+    convoy.fleet.action_fed_add_pool(
         ctx.table_client, ctx.config, federation_id, batch_service_url, poolid)
 
 
-@id.command('remove')
+@fed.command('remove')
 @click.argument('federation-id')
 @click.option(
     '--all', is_flag=True, help='Remove all pools from federation')
@@ -2554,25 +2554,25 @@ def fed_id_add(ctx, federation_id, batch_service_url, poolid):
 @keyvault_options
 @aad_options
 @pass_cli_context
-def fed_id_remove(ctx, federation_id, all, batch_service_url, poolid):
+def fed_remove(ctx, federation_id, all, batch_service_url, poolid):
     """Remove a pool from a federation"""
     ctx.initialize_for_federation()
-    convoy.fleet.action_fed_id_remove_pool(
+    convoy.fleet.action_fed_remove_pool(
         ctx.table_client, ctx.config, federation_id, all, batch_service_url,
         poolid)
 
 
-@id.command('destroy')
+@fed.command('destroy')
 @click.argument('federation-id')
 @common_options
 @federation_options
 @keyvault_options
 @aad_options
 @pass_cli_context
-def fed_id_destroy(ctx, federation_id):
-    """Destroy a federation id"""
+def fed_destroy(ctx, federation_id):
+    """Destroy a federation"""
     ctx.initialize_for_federation()
-    convoy.fleet.action_fed_id_destroy(
+    convoy.fleet.action_fed_destroy(
         ctx.blob_client, ctx.table_client, ctx.queue_client, ctx.config,
         federation_id)
 
@@ -2639,7 +2639,7 @@ def fed_jobs_term(
     """Terminate a job or job schedule in a federation"""
     ctx.initialize_for_federation()
     convoy.fleet.action_fed_jobs_del_or_term(
-        ctx.table_client, ctx.queue_client, ctx.config,
+        ctx.blob_client, ctx.table_client, ctx.queue_client, ctx.config,
         False, federation_id, jobid, jobscheduleid, all_jobs, all_jobschedules)
 
 
@@ -2664,7 +2664,7 @@ def fed_jobs_del(
     """Delete a job or job schedule in a federation"""
     ctx.initialize_for_federation()
     convoy.fleet.action_fed_jobs_del_or_term(
-        ctx.table_client, ctx.queue_client, ctx.config,
+        ctx.blob_client, ctx.table_client, ctx.queue_client, ctx.config,
         True, federation_id, jobid, jobscheduleid, all_jobs, all_jobschedules)
 
 

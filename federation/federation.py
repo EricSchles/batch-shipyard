@@ -1045,6 +1045,18 @@ class FederationDataHandler():
             endpoint_suffix=ep
         )
 
+    def construct_blob_url(
+            self,
+            target: str,
+            unique_id: str
+    ) -> str:
+        return 'https://{sa}.blob.{ep}/messages/{target}/{uid}.pickle'.format(
+            sa=self.service_proxy.creds.storage_account,
+            ep=self.service_proxy.creds.storage_account_ep,
+            target=target,
+            uid=unique_id
+        )
+
     def retrieve_blob_data(
             self,
             url: str
@@ -1060,12 +1072,18 @@ class FederationDataHandler():
         ep = '.'.join(host[2:])
         del host
         tmp = '/'.join(tmp[3:]).split('?')
-        sas = tmp[1]
+        if len(tmp) > 1:
+            sas = tmp[1]
+        else:
+            sas = None
         tmp = tmp[0].split('/')
         container = tmp[0]
         blob_name = '/'.join(tmp[1:])
         del tmp
-        blob_client = self._create_blob_client(sa, ep, sas)
+        if sas is not None:
+            blob_client = self._create_blob_client(sa, ep, sas)
+        else:
+            blob_client = self.service_proxy.blob_client
         data = blob_client.get_blob_to_bytes(container, blob_name)
         return blob_client, container, blob_name, data.content
 
@@ -1422,9 +1440,9 @@ class Federation():
                 entity['UniqueIds'] = ','.join(tmp[-32:])
                 del tmp
         logger.debug(
-            'upserting location entity for job {} uid {} on pool {} '
+            'upserting location entity for job {} on pool {} uid={}'
             '(batch_account={} service_url={})'.format(
-                job_id, unique_id, pool.pool_id, pool.batch_account,
+                job_id, pool.pool_id, unique_id, pool.batch_account,
                 pool.service_url))
         fdh.upsert_location_entity_for_job(entity)
 
@@ -1557,8 +1575,8 @@ class FederationProcessor():
         num_tasks = len(task_map)
         logger.debug(
             'attempting to match job {} with {} tasks in fed {} '
-            'constraints={} naming={}'.format(
-                job.id, num_tasks, fedhash, constraints, naming))
+            'uid={} constraints={} naming={}'.format(
+                job.id, num_tasks, fedhash, unique_id, constraints, naming))
         blacklist = set()
         while True:
             # TODO implement graylist and blacklist
@@ -1594,8 +1612,8 @@ class FederationProcessor():
         num_tasks = constraints['tasks_per_recurrence']
         logger.debug(
             'attempting to match job schedule {} with {} tasks in fed {} '
-            'constraints={}'.format(
-                job_schedule.id, num_tasks, fedhash, constraints))
+            'uid={} constraints={}'.format(
+                job_schedule.id, num_tasks, fedhash, unique_id, constraints))
         blacklist = set()
         while True:
             # TODO implement graylist and blacklist
@@ -1669,12 +1687,17 @@ class FederationProcessor():
                     job_id, fedhash, unique_id))
             return
 
-    async def process_message_action_v1(
-            self, fedhash, action, target_type, job_id, data, unique_id):
+    async def process_message_action_v1(self, fedhash, data, unique_id):
+        # check proper version
         if is_not_empty(data) and data['version'] != '1':
             logger.error('cannot process job data version {} for {}'.format(
                 data['version'], unique_id))
             return
+        # extract data from message
+        action = data['action']['method']
+        target_type = data['action']['kind']
+        job_id = data[target_type]['id']
+        # take action depending upon kind and method
         if target_type == 'job_schedule':
             if action == 'add':
                 if job_id != data[target_type]['id']:
@@ -1731,45 +1754,48 @@ class FederationProcessor():
                 'federation hash mismatch, expected={} actual={} id={}'.format(
                     fedhash, calc_fedhash, target_fedid))
             return True, None
-        action = msg['action']['method']
-        target_type = msg['action']['kind']
-        unique_id = msg[target_type]['uuid']
-        job_id = msg[target_type]['id']
+        target = msg['target']
+        unique_id = msg['uuid']
         # get sequence from table
-        seq_id = self.fdh.get_first_sequence_id_for_job(fedhash, job_id)
+        seq_id = self.fdh.get_first_sequence_id_for_job(fedhash, target)
         if seq_id is None:
             logger.error(
-                'sequence length is non-positive for job {} on '
-                'federation {}'.format(job_id, fedhash))
+                'sequence length is non-positive for target {} on '
+                'federation {}'.format(target, fedhash))
             return True, None
-
-        # TODO warn only, then process first seq_id instead of unique_id
-        # create method to construct blob_data
-        # check method is add and kind
-        # modify retrieve_blob_data to understand non-sas and
-        # fallback to blob client on federation to download
-
+        # if there is a sequence mismatch, then queue is no longer FIFO
+        # get the appropriate next sequence id and construct the blob url
+        # for the message data
         if seq_id != unique_id:
             logger.warning(
-                'skipping queue message for fed {} that does not match first '
-                'sequence q:{} != t:{} for job {}'.format(
-                    fedhash, unique_id, seq_id, job_id))
-            return False, None
-
+                'queue message for fed {} does not match first '
+                'sequence q:{} != t:{} for target {}'.format(
+                    fedhash, unique_id, seq_id, target))
+            unique_id = seq_id
+            blob_url = self.fdh.construct_blob_url(target, unique_id)
+        else:
+            blob_url = msg['blob_data']
+        del seq_id
+        # retrieve message data from blob
         job_data = None
-        # retrieve job/task data
-        if 'blob_data' in msg[target_type]:
+        try:
             blob_client, container, blob_name, data = \
-                self.fdh.retrieve_blob_data(msg[target_type]['blob_data'])
+                self.fdh.retrieve_blob_data(blob_url)
+        except Exception as exc:
+            logger.exception(str(exc))
+            logger.error(
+                'cannot process queue message for sequence id {} for '
+                'fed {}'.format(unique_id, fedhash))
+        else:
             job_data = pickle.loads(data, fix_imports=True)
             del data
+        del blob_url
         # process message
-        await self.process_message_action_v1(
-            fedhash, action, target_type, job_id, job_data, unique_id)
-        # delete blob
         if job_data is not None:
+            await self.process_message_action_v1(fedhash, job_data, unique_id)
+            # delete blob
             self.fdh.delete_blob(blob_client, container, blob_name)
-        return True, job_id
+        return True, target
 
     async def process_federation_queue(self, fedhash: str) -> None:
         acquired = self.federations[fedhash].lock.acquire(blocking=False)

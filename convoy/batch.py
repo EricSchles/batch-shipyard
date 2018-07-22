@@ -42,7 +42,6 @@ try:
     import pathlib2 as pathlib
 except ImportError:
     import pathlib
-import pickle
 import ssl
 import sys
 import tempfile
@@ -4978,7 +4977,7 @@ def add_jobs(
             taskmaploc = 'jobschedules/{}/{}'.format(
                 job_id, _TASKMAP_PICKLE_FILE)
             # pickle and upload task map
-            sas_url = pickle_and_upload(
+            sas_url = storage.pickle_and_upload(
                 blob_client, task_map, taskmaploc, federation_id=federation_id)
             # attach as resource file to jm task
             jobschedule.job_specification.job_manager_task.resource_files.\
@@ -5008,12 +5007,17 @@ def add_jobs(
                     raise RuntimeError(
                         'job schedule {} exists in federation id {}'.format(
                             jobschedule.id, federation_id))
+                kind = 'job_schedule'
                 logger.debug(
                     'submitting job schedule {} for federation {}'.format(
                         jobschedule.id, federation_id))
                 # encapsulate job schedule and task map sas pickle in json
                 info = {
                     'version': '1',
+                    'action': {
+                        'method': 'add',
+                        'kind': kind,
+                    },
                     'job_schedule': {
                         'id': jobschedule.id,
                         'data': jobschedule,
@@ -5031,23 +5035,16 @@ def add_jobs(
                     )
                 # pickle json and upload
                 unique_id = uuid.uuid4()
-                jsloc = 'jobschedules/{}/{}.pickle'.format(
-                    jobschedule.id, unique_id)
-                sas_url = pickle_and_upload(
+                jsloc = 'messages/{}.pickle'.format(unique_id)
+                sas_url = storage.pickle_and_upload(
                     blob_client, info, jsloc, federation_id=federation_id)
                 # construct queue message
                 info = {
                     'version': '1',
                     'federation_id': federation_id,
-                    'action': {
-                        'method': 'add',
-                        'kind': 'job_schedule',
-                    },
-                    'job_schedule': {
-                        'blob_data': sas_url,
-                        'id': jobschedule.id,
-                        'uuid': str(unique_id),
-                    },
+                    'target': jobschedule.id,
+                    'blob_data': sas_url,
+                    'uuid': str(unique_id),
                 }
                 # enqueue action to global queue
                 logger.debug('enqueuing action {} to federation {}'.format(
@@ -5055,7 +5052,7 @@ def add_jobs(
                 try:
                     storage.add_job_to_federation(
                         table_client, queue_client, federation_id, unique_id,
-                        info)
+                        info, kind)
                 except Exception:
                     # delete uploaded files
                     storage.delete_resource_file(
@@ -5075,11 +5072,16 @@ def add_jobs(
                             on_all_tasks_complete=batchmodels.
                             OnAllTasksComplete.terminate_job))
             else:
+                kind = 'job'
                 logger.debug('submitting job {} for federation {}'.format(
                     job_id, federation_id))
                 # encapsulate job, auto_complete and task map in json
                 info = {
                     'version': '1',
+                    'action': {
+                        'method': 'add',
+                        'kind': kind,
+                    },
                     'job': {
                         'id': job_id,
                         'data': job,
@@ -5102,22 +5104,16 @@ def add_jobs(
                     info['job']['constraints']['merge_task'] = merge_task_id
                 # pickle json and upload
                 unique_id = uuid.uuid4()
-                jloc = 'jobs/{}/{}.pickle'.format(job_id, unique_id)
-                sas_url = pickle_and_upload(
+                jloc = 'messages/{}.pickle'.format(unique_id)
+                sas_url = storage.pickle_and_upload(
                     blob_client, info, jloc, federation_id=federation_id)
                 # construct queue message
                 info = {
                     'version': '1',
                     'federation_id': federation_id,
-                    'action': {
-                        'method': 'add',
-                        'kind': 'job',
-                    },
-                    'job': {
-                        'blob_data': sas_url,
-                        'id': job_id,
-                        'uuid': str(unique_id),
-                    },
+                    'target': job_id,
+                    'blob_data': sas_url,
+                    'uuid': str(unique_id),
                 }
                 # enqueue action to global queue
                 logger.debug('enqueuing action {} to federation {}'.format(
@@ -5125,7 +5121,7 @@ def add_jobs(
                 try:
                     storage.add_job_to_federation(
                         table_client, queue_client, federation_id, unique_id,
-                        info)
+                        info, kind)
                 except Exception:
                     # delete uploaded files
                     storage.delete_resource_file(
@@ -5142,38 +5138,3 @@ def add_jobs(
             stream_file_and_wait_for_task(
                 batch_client, config, filespec='{},{},{}'.format(
                     lastjob, lasttaskid, tail), disk=False)
-
-
-def pickle_and_upload(blob_client, data, rpath, federation_id=None):
-    # type: (azureblob.BlockBlobService, dict, str, str) -> str
-    """Pickle and upload data to a given remote path
-    :param azure.storage.blob.BlockBlobService blob_client: blob client
-    :param dict data: data to pickle
-    :param str rpath: remote path
-    :param str federation_id: federation id
-    :rtype: str
-    :return: sas url of uploaded pickle
-    """
-    f = tempfile.NamedTemporaryFile(mode='wb', delete=False)
-    fname = f.name
-    try:
-        with open(fname, 'wb') as f:
-            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-        f.close()
-        if util.is_none_or_empty(federation_id):
-            sas_urls = storage.upload_resource_files(
-                blob_client, [(rpath, fname)])
-        else:
-            sas_urls = storage.upload_job_for_federation(
-                blob_client, federation_id, [(rpath, fname)])
-        if len(sas_urls) != 1:
-            raise RuntimeError(
-                'unexpected number of sas urls for pickled upload')
-        return next(iter(sas_urls.values()))
-    finally:
-        try:
-            os.unlink(fname)
-        except OSError:
-            pass
-        del f
-        del fname

@@ -4394,7 +4394,7 @@ def action_monitor_destroy(
         generate_from_prefix=generate_from_prefix, wait=wait)
 
 
-def action_fed_create(
+def action_fed_proxy_create(
         auth_client, resource_client, compute_client, network_client,
         blob_client, table_client, queue_client, config):
     # type: (azure.mgmt.authorization.AuthorizationManagementClient,
@@ -4404,7 +4404,7 @@ def action_fed_create(
     #        azure.storage.blob.BlockBlobService,
     #        azure.cosmosdb.table.TableService,
     #        azure.storage.queue.QueueService, dict) -> None
-    """Action: Fed Create
+    """Action: Fed Proxy Create
     :param azure.mgmt.authorization.AuthorizationManagementClient auth_client:
         auth client
     :param azure.mgmt.resource.resources.ResourceManagementClient
@@ -4432,12 +4432,12 @@ def action_fed_create(
         _FEDERATIONPREP_FILE, _ALL_FEDERATION_FILES)
 
 
-def action_fed_ssh(
+def action_fed_proxy_ssh(
         compute_client, network_client, config, tty, command):
     # type: (azure.mgmt.compute.ComputeManagementClient,
     #        azure.mgmt.network.NetworkManagementClient, dict,
     #        bool, tuple) -> None
-    """Action: Fed Ssh
+    """Action: Fed Proxy Ssh
     :param azure.mgmt.compute.ComputeManagementClient compute_client:
         compute client
     :param azure.mgmt.network.NetworkManagementClient network_client:
@@ -4452,7 +4452,7 @@ def action_fed_ssh(
         compute_client, network_client, config, tty, command)
 
 
-def action_fed_destroy(
+def action_fed_proxy_destroy(
         resource_client, compute_client, network_client, blob_client,
         table_client, queue_client, config, delete_all_resources,
         delete_virtual_network, generate_from_prefix, wait):
@@ -4463,7 +4463,7 @@ def action_fed_destroy(
     #        azure.cosmosdb.table.TableService,
     #        azure.storage.queue.QueueService, dict, bool, bool,
     #        bool, bool) -> None
-    """Action: Fed Destroy
+    """Action: Fed Proxy Destroy
     :param azure.mgmt.resource.resources.ResourceManagementClient
         resource_client: resource client
     :param azure.mgmt.compute.ComputeManagementClient compute_client:
@@ -4494,12 +4494,12 @@ def action_fed_destroy(
         generate_from_prefix=generate_from_prefix, wait=wait)
 
 
-def action_fed_id_create(
+def action_fed_create(
         blob_client, table_client, queue_client, config, federation_id):
     # type: (azure.storage.blob.BlockBlobService,
     #        azure.cosmosdb.table.TableService,
     #        azure.storage.queue.QueueService, dict, str) -> None
-    """Action: Fed Id Create
+    """Action: Fed Create
     :param azure.storage.blob.BlockBlobService blob_client: blob client
     :param azure.cosmosdb.table.TableService table_client: table client
     :param azure.storage.queue.QueueService queue_client: queue client
@@ -4513,10 +4513,10 @@ def action_fed_id_create(
         blob_client, table_client, queue_client, federation_id.lower())
 
 
-def action_fed_id_list(
+def action_fed_list(
         table_client, config, federation_id):
     # type: (azure.cosmosdb.table.TableService, dict, List[str]) -> None
-    """Action: Fed Id List
+    """Action: Fed List
     :param azure.cosmosdb.table.TableService table_client: table client
     :param dict config: configuration dict
     :param List[str] federation_id: federation ids
@@ -4524,11 +4524,11 @@ def action_fed_id_list(
     storage.list_federations(table_client, config, federation_id)
 
 
-def action_fed_id_add_pool(
+def action_fed_add_pool(
         table_client, config, federation_id, batch_service_url, pools):
     # type: (azure.cosmosdb.table.TableService, dict, str, str,
     #        List[str]) -> None
-    """Action: Fed Id Add
+    """Action: Fed Add
     :param azure.mgmt.compute.ComputeManagementClient compute_client:
         compute client
     :param azure.mgmt.network.NetworkManagementClient network_client:
@@ -4551,11 +4551,11 @@ def action_fed_id_add_pool(
         table_client, config, federation_id.lower(), batch_service_url, pools)
 
 
-def action_fed_id_remove_pool(
+def action_fed_remove_pool(
         table_client, config, federation_id, all, batch_service_url, pools):
     # type: (azure.cosmosdb.table.TableService, dict, str, bool, str,
     #        List[str]) -> None
-    """Action: Fed Id Remove
+    """Action: Fed Remove
     :param azure.mgmt.compute.ComputeManagementClient compute_client:
         compute client
     :param azure.mgmt.network.NetworkManagementClient network_client:
@@ -4579,12 +4579,12 @@ def action_fed_id_remove_pool(
         pools)
 
 
-def action_fed_id_destroy(
+def action_fed_destroy(
         blob_client, table_client, queue_client, config, federation_id):
     # type: (azure.storage.blob.BlockBlobService,
     #        azure.cosmosdb.table.TableService,
     #        azure.storage.queue.QueueService, dict, str) -> None
-    """Action: Fed Id Destroy
+    """Action: Fed Destroy
     :param azure.storage.blob.BlockBlobService blob_client: blob client
     :param azure.cosmosdb.table.TableService table_client: table client
     :param azure.storage.queue.QueueService queue_client: queue client
@@ -4631,6 +4631,7 @@ def action_fed_jobs_list(
     # type: (azure.cosmosdb.table.TableService,
     #        dict, str, str, str) -> None
     """Action: Fed Jobs List
+    :param azure.storage.blob.BlockBlobService blob_client: blob client
     :param azure.cosmosdb.table.TableService table_client: table client
     :param azure.storage.queue.QueueService queue_client: queue client
     :param dict config: configuration dict
@@ -4645,12 +4646,14 @@ def action_fed_jobs_list(
 
 
 def action_fed_jobs_del_or_term(
-        table_client, queue_client, config, delete, federation_id, jobid,
-        jobscheduleid, all_jobs, all_jobschedules):
-    # type: (azure.cosmosdb.table.TableService,
+        blob_client, table_client, queue_client, config, delete, federation_id,
+        jobid, jobscheduleid, all_jobs, all_jobschedules):
+    # type: (azure.storage.blob.BlockBlobService,
+    #        azure.cosmosdb.table.TableService,
     #        azure.storage.queue.QueueService, dict, bool, str, str,
     #        bool, bool) -> None
     """Action: Fed Jobs Del or Term
+    :param azure.storage.blob.BlockBlobService blob_client: blob client
     :param azure.cosmosdb.table.TableService table_client: table client
     :param azure.storage.queue.QueueService queue_client: queue client
     :param dict config: configuration dict
@@ -4674,5 +4677,5 @@ def action_fed_jobs_del_or_term(
         if jobid is None and jobscheduleid is None:
             raise ValueError('no valid option specified')
     storage.delete_or_terminate_job_from_federation(
-        table_client, queue_client, delete, federation_id, jobid,
+        blob_client, table_client, queue_client, delete, federation_id, jobid,
         jobscheduleid, all_jobs, all_jobschedules)
