@@ -417,7 +417,7 @@ MonitoringVmSettings = collections.namedtuple(
 FederationProxyOptionsSettings = collections.namedtuple(
     'FederationProxyOptionsSettings', [
         'federations_polling_interval', 'jobs_polling_interval',
-        'log_persistence', 'log_level',
+        'log_persistence', 'log_level', 'log_filename',
     ]
 )
 
@@ -4454,6 +4454,7 @@ def federation_proxy_options_settings(config):
         jobs_polling_interval=str(_kv_read(pi_conf, 'jobs', 5)),
         log_persistence=_kv_read(log_conf, 'persistence', True),
         log_level=_kv_read_checked(log_conf, 'level', 'debug'),
+        log_filename=_kv_read_checked(log_conf, 'filename', 'fedproxy.log'),
     )
 
 

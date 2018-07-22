@@ -89,7 +89,8 @@ def _create_virtual_machine_extension(
     cmd = './{bsf}{a}{log}{r}{s}{v}'.format(
         bsf=bootstrap_file[0],
         a=' -a {}'.format(settings.determine_cloud_type_from_aad(config)),
-        log=' -l {}:{}'.format(fpo.log_persistence, fpo.log_level),
+        log=' -l {}:{}:{}'.format(
+            fpo.log_persistence, fpo.log_level, fpo.log_filename),
         r=' -r {}:{}'.format(
             fpo.federations_polling_interval, fpo.jobs_polling_interval),
         s=' -s {}:{}:{}'.format(

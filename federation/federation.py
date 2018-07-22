@@ -276,6 +276,10 @@ class ServiceProxy():
     def logger_persist(self) -> bool:
         return self._config['logging']['persistence']
 
+    @property
+    def logger_filename(self) -> bool:
+        return self._config['logging']['filename']
+
     def log_configuration(self) -> None:
         logger.debug('configuration: {}'.format(
             json.dumps(self._config, sort_keys=True, indent=4)))
@@ -717,6 +721,7 @@ class FederationDataHandler():
     _FEDERATION_ACTIONS_PREFIX_PK = '!!ACTIONS'
     _MAX_SEQUENCE_ID_PROPERTIES = 10
     _MAX_SEQUENCE_IDS_PER_PROPERTY = 990
+    _MAX_STR_ENTITY_PROPERTY_LENGTH = 31744
 
     def __init__(self, service_proxy: ServiceProxy) -> None:
         """Ctor for Federation data handler
@@ -830,7 +835,9 @@ class FederationDataHandler():
         if log_path is None:
             logger.warning('not setting logfile as persistence is disabled')
         else:
-            logfile = log_path / 'fedproxy.log'
+            logfile = log_path / pathlib.Path(
+                self.service_proxy.logger_filename)
+            logfile.parent.mkdir(exist_ok=True)
             handler_logfile = logging.handlers.RotatingFileHandler(
                 str(logfile), maxBytes=33554432, encoding='utf-8')
             handler_logfile.setFormatter(formatter)
@@ -1380,6 +1387,7 @@ class Federation():
             fdh: FederationDataHandler,
             target_pool: str,
             job_id: str,
+            is_job_schedule: bool,
             unique_id: str,
     ) -> None:
         # get pool ref
@@ -1392,6 +1400,7 @@ class Federation():
             entity = {
                 'PartitionKey': pk,
                 'RowKey': rk,
+                'Kind': 'job_schedule' if is_job_schedule else 'job',
                 'PoolId': pool.pool_id,
                 'BatchAccount': pool.batch_account,
                 'ServiceUrl': pool.service_url,
@@ -1401,8 +1410,17 @@ class Federation():
         else:
             entity['AdditionTimestamps'] = '{},{}'.format(
                 entity['AdditionTimestamps'], datetime_utcnow(as_string=True))
+            if (len(entity['AdditionTimestamps']) >
+                    self._MAX_STR_ENTITY_PROPERTY_LENGTH):
+                tmp = entity['AdditionTimestamps'].split(',')
+                entity['AdditionTimestamps'] = ','.join(tmp[-32:])
+                del tmp
             entity['UniqueIds'] = '{},{}'.format(
                 entity['UniqueIds'], datetime_utcnow(as_string=True))
+            if len(entity['UniqueIds']) > self._MAX_STR_ENTITY_PROPERTY_LENGTH:
+                tmp = entity['UniqueIds'].split(',')
+                entity['UniqueIds'] = ','.join(tmp[-32:])
+                del tmp
         logger.debug(
             'upserting location entity for job {} uid {} on pool {} '
             '(batch_account={} service_url={})'.format(
@@ -1553,7 +1571,7 @@ class FederationProcessor():
                     self.bsh, poolrk, job, constraints)
                 if cj:
                     self.federations[fedhash].track_job(
-                        self.fdh, poolrk, job.id, unique_id)
+                        self.fdh, poolrk, job.id, False, unique_id)
                     self.federations[fedhash].schedule_tasks(
                         self.bsh, poolrk, job.id, constraints, naming,
                         task_map)
@@ -1590,7 +1608,7 @@ class FederationProcessor():
                     self.bsh, poolrk, job_schedule, constraints)
                 if cj:
                     self.federations[fedhash].track_job(
-                        self.fdh, poolrk, job_schedule.id, unique_id)
+                        self.fdh, poolrk, job_schedule.id, True, unique_id)
                     break
                 else:
                     blacklist.add(poolrk)
@@ -1721,21 +1739,30 @@ class FederationProcessor():
         seq_id = self.fdh.get_first_sequence_id_for_job(fedhash, job_id)
         if seq_id is None:
             logger.error(
-                'sequence length is non-positive for federation {}'.format(
-                    fedhash))
+                'sequence length is non-positive for job {} on '
+                'federation {}'.format(job_id, fedhash))
             return True, None
+
+        # TODO warn only, then process first seq_id instead of unique_id
+        # create method to construct blob_data
+        # check method is add and kind
+        # modify retrieve_blob_data to understand non-sas and
+        # fallback to blob client on federation to download
+
         if seq_id != unique_id:
             logger.warning(
                 'skipping queue message for fed {} that does not match first '
                 'sequence q:{} != t:{} for job {}'.format(
                     fedhash, unique_id, seq_id, job_id))
             return False, None
+
         job_data = None
         # retrieve job/task data
         if 'blob_data' in msg[target_type]:
             blob_client, container, blob_name, data = \
                 self.fdh.retrieve_blob_data(msg[target_type]['blob_data'])
             job_data = pickle.loads(data, fix_imports=True)
+            del data
         # process message
         await self.process_message_action_v1(
             fedhash, action, target_type, job_id, job_data, unique_id)

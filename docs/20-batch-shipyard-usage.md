@@ -123,6 +123,8 @@ The following commands support this option:
     * `cert list`
     * `jobs list`
     * `jobs tasks list`
+    * `fed id list`
+    * `fed jobs list`
     * `pool autoscale evaluate`
     * `pool autoscale lastexec`
     * `pool images list`

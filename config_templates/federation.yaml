@@ -38,3 +38,4 @@ federation:
     logging:
       persistence: true
       level: debug
+      filename: fedproxy.log

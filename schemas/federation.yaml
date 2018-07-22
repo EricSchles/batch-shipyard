@@ -107,3 +107,5 @@ mapping:
               level:
                 type: str
                 enum: ['debug', 'info', 'warning', 'error', 'critical']
+              filename:
+                type: str

@@ -2506,6 +2506,21 @@ def fed_id_create(ctx, federation_id):
         federation_id)
 
 
+@id.command('list')
+@click.option(
+    '--federation-id', multiple=True, help='Limit to specified federation id')
+@common_options
+@federation_options
+@keyvault_options
+@aad_options
+@pass_cli_context
+def fed_id_list(ctx, federation_id):
+    """List all federations"""
+    ctx.initialize_for_federation()
+    convoy.fleet.action_fed_id_list(
+        ctx.table_client, ctx.config, federation_id)
+
+
 @id.command('add')
 @click.argument('federation-id')
 @click.option(
@@ -2583,6 +2598,24 @@ def fed_jobs_add(ctx, federation_id):
     convoy.fleet.action_fed_jobs_add(
         ctx.batch_client, ctx.keyvault_client, ctx.blob_client,
         ctx.table_client, ctx.queue_client, ctx.config, federation_id)
+
+
+@jobs.command('list')
+@click.argument('federation-id')
+@click.option(
+    '--jobid', help='List the specified job id')
+@click.option(
+    '--jobscheduleid', help='List the specified job schedule id')
+@common_options
+@federation_options
+@keyvault_options
+@aad_options
+@pass_cli_context
+def fed_jobs_list(ctx, federation_id, jobid, jobscheduleid):
+    """List jobs or job schedules in a federation"""
+    ctx.initialize_for_federation()
+    convoy.fleet.action_fed_jobs_list(
+        ctx.table_client, ctx.config, federation_id, jobid, jobscheduleid)
 
 
 @jobs.command('term')
