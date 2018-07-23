@@ -155,6 +155,40 @@ mapping:
           default_working_dir:
             type: str
             enum: ['batch', 'container']
+          federation_constraints:
+            type: map
+            mapping:
+              pool:
+                type: map
+                mapping:
+                  native:
+                    type: bool
+                  windows:
+                    type: bool
+                  location:
+                    type: str
+                  virtual_network_arm_id:
+                    type: str
+                  low_priority_nodes:
+                    type: map
+                    mapping:
+                      allow:
+                        type: bool
+                        required: true
+                      exclusive:
+                        type: bool
+                        required: true
+              compute_node:
+                type: map
+                mapping:
+                  cores:
+                    type: int
+                  memory:
+                    type: str
+                  gpu:
+                    type: bool
+                  infiniband:
+                    type: bool
           tasks:
             type: seq
             sequence:

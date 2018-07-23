@@ -65,6 +65,7 @@ import msrestazure.azure_cloud
 logger = logging.getLogger(__name__)
 # global defines
 _MAX_EXECUTOR_WORKERS = min((multiprocessing.cpu_count() * 4, 32))
+_MAX_TIMESPAN_POOL_UPDATE = datetime.timedelta(seconds=60)
 
 
 def _setup_logger() -> None:
@@ -1115,6 +1116,7 @@ class FederationPool():
         self.node_counts_refresh_epoch = None
         self.vm_props = vm_size
         self._vm_size = None
+        self.last_update_time = datetime_utcnow()
         if self.is_valid:
             self._vm_size = self.cloud_pool.vm_size.lower()
 
@@ -1123,6 +1125,14 @@ class FederationPool():
         if self.cloud_pool is not None and self.vm_props is not None:
             return self.cloud_pool.state == batchmodels.PoolState.active
         return False
+
+    @property
+    def requires_update(self) -> bool:
+        return (
+            not self.is_valid or
+            (datetime_utcnow() - self.last_update_time) >
+            _MAX_TIMESPAN_POOL_UPDATE
+        )
 
     @property
     def vm_size(self) -> Optional[str]:
@@ -1176,7 +1186,7 @@ class Federation():
     ) -> str:
         rk = entity['RowKey']
         with self.lock:
-            if rk in self.pools:
+            if rk in self.pools and self.pools[rk].is_valid:
                 poolset.add(rk)
                 return rk
         batch_account = entity['BatchAccount']
@@ -1221,6 +1231,43 @@ class Federation():
             logger.info('active pools in federation {} id={}: {}'.format(
                 self.hash, self.id, ' '.join(self.pools.keys())))
 
+    def _filter_pool_with_constraints(
+            self,
+            pool: FederationPool,
+            constraints: Dict[str, Any],
+            unique_id: str,
+    ) -> bool:
+        cp = pool.cloud_pool
+        # multi-instance
+        if (constraints['has_multi_instance'] and
+                not cp.enable_inter_node_communication):
+            logger.debug(
+                'uid {} incompatible with pool {} due to multi-instance and '
+                'internode comm'.format(unique_id, cp.id))
+            return True
+        # native
+        if constraints['native']:
+            native = False
+            for md in cp.metadata:
+                if md.name == 'BATCH_SHIPYARD_NATIVE_CONTAINER_POOL':
+                    native = md.value == '1'
+                    break
+            if not native:
+                logger.debug(
+                    'uid {} incompatible with pool {} due to native '
+                    'mode requirement'.format(unique_id, cp.id))
+                return True
+        # windows
+        if (constraints['windows'] and
+                cp.virtual_machine_configuration.node_agent_sku_id.lower() !=
+                'batch.node.windows amd64'):
+            logger.debug(
+                'uid {} incompatible with pool {} due to windows '
+                'requirement'.format(unique_id, cp.id))
+            return True
+        # filtering passed
+        return False
+
     def find_target_pool_for_job(
             self,
             bsh: BatchServiceHandler,
@@ -1243,15 +1290,16 @@ class Federation():
                 continue
             pool = self.pools[rk]
             # refresh pool
-            if not pool.is_valid:
+            if pool.requires_update:
                 pool.cloud_pool = bsh.get_pool_full_update(
                     pool.batch_account, pool.service_url, pool.pool_id)
                 if not pool.is_valid:
                     continue
-            # TODO resource contraint filtering
-
-            # TODO handle when there are no pools that can be matched
-
+            # contraint filtering
+            if self._filter_pool_with_constraints(
+                    pool, constraints, unique_id):
+                blacklist.add(rk)
+                continue
             # refresh node state counts
             if unique_id != pool.node_counts_refresh_epoch:
                 pool.node_counts = bsh.get_node_state_counts(
@@ -1274,6 +1322,9 @@ class Federation():
             )
             if avail_lowpriority_vms[rk] == 0:
                 avail_lowpriority_vms.pop(rk)
+
+        # TODO handle when there are no pools that can be matched
+
         if len(idle_dedicated_vms) == 0 and len(idle_lowpriority_vms) == 0:
             if (len(avail_dedicated_vms) != 0 or
                     len(avail_lowpriority_vms) != 0):
@@ -1687,44 +1738,38 @@ class FederationProcessor():
                     job_id, fedhash, unique_id))
             return
 
-    async def process_message_action_v1(self, fedhash, data, unique_id):
+    async def process_message_action_v1(
+        self,
+        fedhash: str,
+        data: Dict[str, Any],
+        unique_id: str
+    ) -> bool:
         # check proper version
         if is_not_empty(data) and data['version'] != '1':
             logger.error('cannot process job data version {} for {}'.format(
                 data['version'], unique_id))
-            return
+            return True
         # extract data from message
         action = data['action']['method']
         target_type = data['action']['kind']
-        job_id = data[target_type]['id']
+        target = data[target_type]['id']
         # take action depending upon kind and method
         if target_type == 'job_schedule':
             if action == 'add':
-                if job_id != data[target_type]['id']:
-                    logger.error(
-                        'job schedule id mismatch q:{} != b:{} for '
-                        'fed {}'.format(
-                            job_id, data[target_type]['id'], fedhash))
-                    return
                 job_schedule = data[target_type]['data']
                 constraints = data[target_type]['constraints']
                 await self.add_job_schedule_v1(
                     fedhash, job_schedule, constraints, unique_id)
             elif action == 'terminate':
                 await self.delete_or_terminate_job_v1(
-                    False, fedhash, job_id, True, unique_id)
+                    False, fedhash, target, True, unique_id)
             elif action == 'delete':
                 await self.delete_or_terminate_job_v1(
-                    True, fedhash, job_id, True, unique_id)
+                    True, fedhash, target, True, unique_id)
             else:
                 raise NotImplementedError()
         elif target_type == 'job':
             if action == 'add':
-                if job_id != data[target_type]['id']:
-                    logger.error(
-                        'job id mismatch q:{} != b:{} for fed {}'.format(
-                            job_id, data[target_type]['id'], fedhash))
-                    return
                 job = data[target_type]['data']
                 constraints = data[target_type]['constraints']
                 naming = data[target_type]['naming']
@@ -1733,14 +1778,15 @@ class FederationProcessor():
                     fedhash, job, constraints, naming, task_map, unique_id)
             elif action == 'terminate':
                 await self.delete_or_terminate_job_v1(
-                    False, fedhash, job_id, False, unique_id)
+                    False, fedhash, target, False, unique_id)
             elif action == 'delete':
                 await self.delete_or_terminate_job_v1(
-                    True, fedhash, job_id, False, unique_id)
+                    True, fedhash, target, False, unique_id)
             else:
                 raise NotImplementedError()
         else:
             logger.error('unknown target type: {}'.format(target_type))
+        return True
 
     async def process_queue_message_v1(
             self,

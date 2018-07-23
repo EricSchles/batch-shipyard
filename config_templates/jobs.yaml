@@ -60,6 +60,20 @@ job_specifications:
       - jobdata*.bin
       blobxfer_extra_options: null
   default_working_dir: batch
+  federation_constraints:
+    pool:
+      native: false
+      windows: false
+      location: eastus
+      virtual_network_arm_id: null
+      low_priority_nodes:
+        allow: true
+        exclusive: false
+    compute_node:
+      cores: 2
+      memory: 512m
+      gpu: false
+      infiniband: false
   tasks:
   - id: null
     docker_image: busybox

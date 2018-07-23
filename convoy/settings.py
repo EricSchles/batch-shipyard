@@ -338,6 +338,22 @@ CustomMountFstabSettings = collections.namedtuple(
         'fs_spec', 'fs_vfstype', 'fs_mntops', 'fs_freq', 'fs_passno',
     ]
 )
+FederationPoolConstraintSettings = collections.namedtuple(
+    'FederationPoolConstraintSettings', [
+        'native', 'windows', 'location', 'virtual_network_arm_id',
+        'low_priority_nodes_allow', 'low_priority_nodes_exclusive',
+    ]
+)
+FederationComputeNodeConstraintSettings = collections.namedtuple(
+    'FederationComputeNodeConstraintSettings', [
+        'cores', 'memory', 'gpu', 'infiniband',
+    ]
+)
+FederationConstraintSettings = collections.namedtuple(
+    'FederationConstraintSettings', [
+        'pool', 'compute_node',
+    ]
+)
 ManagedDisksSettings = collections.namedtuple(
     'ManagedDisksSettings', [
         'location', 'resource_group', 'premium', 'disk_size_gb', 'disk_names',
@@ -3010,6 +3026,59 @@ def job_allow_run_on_missing(conf):
     except KeyError:
         allow = False
     return allow
+
+
+def job_federation_constraint_settings(conf, federation_id):
+    # type: (dict, str) -> dict
+    """Gets federation constraints
+    :param dict conf: job configuration object
+    :param str federation_id: federation id
+    :rtype: dict
+    :return: federation constraints
+    """
+    if util.is_none_or_empty(federation_id):
+        return None
+    fc_conf = _kv_read_checked(conf, 'federation_constraints', default={})
+    pool_conf = _kv_read_checked(fc_conf, 'pool', default={})
+    pool_location = _kv_read_checked(pool_conf, 'location')
+    if pool_location is not None:
+        pool_location = pool_location.lower()
+    pool_virtual_network_arm_id = _kv_read_checked(
+        pool_conf, 'virtual_network_arm_id')
+    if pool_virtual_network_arm_id is not None:
+        pool_virtual_network_arm_id = pool_virtual_network_arm_id.lower()
+    pool_lp_conf = _kv_read_checked(
+        pool_conf, 'low_priority_nodes', default={})
+    node_conf = _kv_read_checked(fc_conf, 'compute_node', default={})
+    node_memory = _kv_read_checked(node_conf, 'memory')
+    if node_memory is not None:
+        node_memory = node_memory.lower()
+        if node_memory[-1] not in ('b', 'k', 'm', 'g'):
+            raise ValueError(
+                'federation_constraints:compute_node:memory has invalid '
+                'suffix')
+        if int(node_memory[:-1]) <= 0:
+            raise ValueError(
+                'federation_constraints:compute_node:memory is a '
+                'non-positive value')
+    return FederationConstraintSettings(
+        pool=FederationPoolConstraintSettings(
+            native=_kv_read(pool_conf, 'native', default=False),
+            windows=_kv_read(pool_conf, 'windows', default=False),
+            location=pool_location,
+            virtual_network_arm_id=pool_virtual_network_arm_id,
+            low_priority_nodes_allow=_kv_read(
+                pool_lp_conf, 'allow', default=True),
+            low_priority_nodes_exclusive=_kv_read(
+                pool_lp_conf, 'exclusive', default=False),
+        ),
+        compute_node=FederationComputeNodeConstraintSettings(
+            cores=_kv_read(node_conf, 'cores'),
+            memory=node_memory,
+            gpu=_kv_read(node_conf, 'gpu'),
+            infiniband=_kv_read(node_conf, 'infiniband'),
+        ),
+    )
 
 
 def job_has_merge_task(conf):

@@ -1496,6 +1496,10 @@ def _construct_pool_object(
                 name=settings.get_metadata_version_name(),
                 value=__version__,
             ),
+            batchmodels.MetadataItem(
+                name='BATCH_SHIPYARD_NATIVE_CONTAINER_POOL',
+                value='1' if native else '0',
+            ),
         ],
         task_scheduling_policy=task_scheduling_policy,
         certificate_references=[]
