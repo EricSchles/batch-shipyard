@@ -66,6 +66,12 @@ logger = logging.getLogger(__name__)
 # global defines
 _MAX_EXECUTOR_WORKERS = min((multiprocessing.cpu_count() * 4, 32))
 _MAX_TIMESPAN_POOL_UPDATE = datetime.timedelta(seconds=60)
+_RDMA_INSTANCES = frozenset((
+    'standard_a8', 'standard_a9',
+))
+_RDMA_INSTANCE_SUFFIXES = frozenset((
+    'r', 'rs', 'rs_v2', 'rs_v3',
+))
 
 
 def _setup_logger() -> None:
@@ -131,6 +137,61 @@ def hash_federation_id(federation_id: str) -> str:
     :return: hashed federation id
     """
     return hash_string(federation_id)
+
+
+def is_rdma_pool(vm_size: str) -> bool:
+    """Check if pool is IB/RDMA capable
+    :param vm_size: vm size
+    :return: if rdma is present
+    """
+    vsl = vm_size.lower()
+    if vsl in _RDMA_INSTANCES:
+        return True
+    elif any(vsl.endswith(x) for x in _RDMA_INSTANCE_SUFFIXES):
+        return True
+    return False
+
+
+class PoolConstraints():
+    def __init__(self, constraints: Dict[str, Any]) -> None:
+        self.custom_image_arm_id = constraints.get('custom_image_arm_id')
+        self.location = constraints.get('location')
+        self.low_priority_nodes_allow = constraints('low_priority_nodes_allow')
+        self.low_priority_nodes_exclusive = constraints(
+            'low_priority_nodes_exclusive')
+        self.native = constraints.get('native')
+        self.virtual_network_arm_id = constraints('virtual_network_arm_id')
+        self.windows = constraints.get('windows')
+
+
+class ComputeNodeConstraints():
+    def __init__(self, constraints: Dict[str, Any]) -> None:
+        self.vm_size = constraints.get('vm_size')
+        self.cores = constraints.get('cores')
+        self.memory = constraints.get('memory')
+        self.gpu = constraints.get('gpu')
+        self.infiniband = constraints.get('infiniband')
+
+
+class TaskConstraints():
+    def __init__(self, constraints: Dict[str, Any]) -> None:
+        self.auto_complete = constraints.get('auto_complete')
+        self.has_multi_instance = constraints.get('has_multi_instance')
+        self.merge_task_id = constraints.get('merge_task_id')
+        self.tasks_per_recurrence = constraints.get('tasks_per_recurrence')
+
+
+class Constraints():
+    def __init__(self, constraints: Dict[str, Any]) -> None:
+        self.pool = PoolConstraints(constraints['pool'])
+        self.compute_node = ComputeNodeConstraints(constraints['compute_node'])
+        self.task = TaskConstraints(constraints['task'])
+
+
+class TaskNaming():
+    def __init__(self, naming: Dict[str, Any]) -> None:
+        self.prefix = naming.get('prefix')
+        self.padding = naming.get('padding')
 
 
 class Credentials():
@@ -540,7 +601,7 @@ class BatchServiceHandler():
             batch_account: str,
             service_url: str,
             job_id: str,
-            naming: Dict[str, Any],
+            naming: TaskNaming,
             current_task_id: str,
             last_task_id: Optional[str]=None,
             tasklist: Optional[List[str]]=None,
@@ -557,12 +618,11 @@ class BatchServiceHandler():
         :return: (list of task ids for job, next generic docker task id)
         """
         # get prefix and padding settings
-        prefix = naming['prefix']
+        prefix = naming.prefix
         if is_merge_task:
             prefix = 'merge-{}'.format(prefix)
         if not current_task_id.startswith(prefix):
             return tasklist, current_task_id
-        padding = naming['padding']
         delimiter = prefix if is_not_empty(prefix) else ' '
         client = self.service_proxy.batch_client(batch_account, service_url)
         # get filtered, sorted list of generic docker task ids
@@ -580,7 +640,7 @@ class BatchServiceHandler():
         except (batchmodels.batch_error.BatchErrorException, IndexError,
                 TypeError):
             tasknum = 0
-        id = self._format_generic_task_id(prefix, padding, tasknum)
+        id = self._format_generic_task_id(prefix, naming.padding, tasknum)
         while id in tasklist:
             try:
                 if (last_task_id is not None and
@@ -590,7 +650,7 @@ class BatchServiceHandler():
             except Exception:
                 last_task_id = None
             tasknum += 1
-            id = self._format_generic_task_id(prefix, padding, tasknum)
+            id = self._format_generic_task_id(prefix, naming.padding, tasknum)
         return tasklist, id
 
     def _submit_task_sub_collection(
@@ -1234,19 +1294,19 @@ class Federation():
     def _filter_pool_with_constraints(
             self,
             pool: FederationPool,
-            constraints: Dict[str, Any],
+            constraints: Constraints,
             unique_id: str,
     ) -> bool:
         cp = pool.cloud_pool
         # multi-instance
-        if (constraints['has_multi_instance'] and
+        if (constraints.task.has_multi_instance and
                 not cp.enable_inter_node_communication):
             logger.debug(
                 'uid {} incompatible with pool {} due to multi-instance and '
                 'internode comm'.format(unique_id, cp.id))
             return True
         # native
-        if constraints['native']:
+        if constraints.pool.native:
             native = False
             for md in cp.metadata:
                 if md.name == 'BATCH_SHIPYARD_NATIVE_CONTAINER_POOL':
@@ -1258,7 +1318,7 @@ class Federation():
                     'mode requirement'.format(unique_id, cp.id))
                 return True
         # windows
-        if (constraints['windows'] and
+        if (constraints.pool.windows and
                 cp.virtual_machine_configuration.node_agent_sku_id.lower() !=
                 'batch.node.windows amd64'):
             logger.debug(
@@ -1272,7 +1332,7 @@ class Federation():
             self,
             bsh: BatchServiceHandler,
             num_tasks: int,
-            constraints: Dict[str, Any],
+            constraints: Constraints,
             blacklist: Set[str],
             unique_id: str
     ) -> Optional[str]:
@@ -1350,7 +1410,7 @@ class Federation():
             bsh: BatchServiceHandler,
             target_pool: str,
             jobschedule: batchmodels.JobScheduleAddParameter,
-            constraints: Dict[str, Any],
+            constraints: Constraints,
     ) -> bool:
         """
         This function should be called with lock already held!
@@ -1381,13 +1441,11 @@ class Federation():
             bsh: BatchServiceHandler,
             target_pool: str,
             job: batchmodels.JobAddParameter,
-            constraints: Dict[str, Any],
+            constraints: Constraints,
     ) -> bool:
         """
         This function should be called with lock already held!
         """
-        multi_instance = constraints['has_multi_instance']
-        auto_complete = constraints['auto_complete']
         # get pool ref
         pool = self.pools[target_pool]
         # overwrite pool id in job
@@ -1413,7 +1471,8 @@ class Federation():
                 success = True
                 # cannot re-use an existing job if multi-instance due to
                 # job release requirement
-                if multi_instance and auto_complete:
+                if (constraints.task.has_multi_instance and
+                        constraints.task.auto_complete):
                     logger.error(
                         'cannot reuse job {} on pool {} with multi_instance '
                         'and auto_complete'.format(job.id, pool.pool_id))
@@ -1497,25 +1556,55 @@ class Federation():
                 pool.service_url))
         fdh.upsert_location_entity_for_job(entity)
 
+    def fixup_task_for_ib_mismatch(
+            self,
+            ib_mismatch: str,
+            task: batchmodels.TaskAddParameter,
+            constraints: Constraints,
+    ) -> batchmodels.TaskAddParameter:
+        if ib_mismatch == 'sles':
+            final = (
+                '/etc/dat.conf:/etc/rdma/dat.conf:ro --device=/dev/hvnd_rdma'
+            )
+        else:
+            final = '/etc/dat.conf:/etc/rdma/dat.conf:ro'
+        if constraints.task.has_multi_instance:
+            # fixup coordination command line
+            cc = task.multi_instance_settings.coordination_command_line
+            cc = cc.replace(
+                '/etc/rdma:/etc/rdma:ro',
+                '/etc/dat.conf:/etc/dat.conf:ro').replace(
+                    '/etc/rdma/dat.conf:/etc/dat.conf:ro', final)
+            task.multi_instance_settings.coordination_command_line = cc
+        # fixup command line
+        task.command_line = task.command_line.replace(
+            '/etc/rdma:/etc/rdma:ro',
+            '/etc/dat.conf:/etc/dat.conf:ro').replace(
+                '/etc/rdma/dat.conf:/etc/dat.conf:ro', final)
+        return task
+
     def schedule_tasks(
             self,
             bsh: BatchServiceHandler,
             target_pool: str,
             job_id: str,
-            constraints: Dict[str, Any],
-            naming: Dict[str, Any],
+            constraints: Constraints,
+            naming: TaskNaming,
             task_map: Dict[str, batchmodels.TaskAddParameter],
     ) -> None:
         """
         This function should be called with lock already held!
         """
-        auto_complete = constraints['auto_complete']
-        try:
-            merge_task_id = constraints['merge_task']
-        except KeyError:
-            merge_task_id = None
         # get pool ref
         pool = self.pools[target_pool]
+        # check if there is an ib mismatch
+        ib_mismatch = None
+        if is_rdma_pool(pool.cloud_pool.vm_size):
+            na = pool.cloud_pool.node_agent_sku_id.lower()
+            if na.startswith('batch.node.ubuntu'):
+                ib_mismatch = 'ubuntu'
+            elif na.startswith('batch.node.sles'):
+                ib_mismatch = 'sles'
         # re-assign task ids to current job:
         # 1. sort task map keys
         # 2. re-map task ids to current job
@@ -1524,12 +1613,15 @@ class Federation():
         tasklist = None
         task_ids = sorted(task_map.keys())
         for tid in task_ids:
-            is_merge_task = tid == merge_task_id
+            is_merge_task = tid == constraints.task.merge_task_id
             tasklist, new_tid = bsh.regenerate_next_generic_task_id(
                 pool.batch_account, pool.service_url, job_id, naming, tid,
                 last_task_id=last_tid, tasklist=tasklist,
                 is_merge_task=is_merge_task)
             task = task_map.pop(tid)
+            if ib_mismatch is not None:
+                task = self.fixup_task_for_ib_mismatch(
+                    task, ib_mismatch, constraints.task.has_multi_instance)
             task_map[new_tid] = task
             if is_merge_task:
                 merge_task_id = new_tid
@@ -1548,7 +1640,7 @@ class Federation():
         bsh.add_task_collection(
             pool.batch_account, pool.service_url, job_id, task_map)
         # set auto complete
-        if auto_complete:
+        if constraints.task.auto_complete:
             bsh.set_auto_complete_on_job(
                 pool.batch_account, pool.service_url, job_id)
 
@@ -1616,7 +1708,14 @@ class FederationProcessor():
         logger.debug('completed federation update')
 
     async def add_job_v1(
-            self, fedhash, job, constraints, naming, task_map, unique_id):
+        self,
+        fedhash: str,
+        job: batchmodels.JobAddParameter,
+        constraints: Constraints,
+        naming: TaskNaming,
+        task_map: Dict[str, batchmodels.TaskAddParameter],
+        unique_id: str
+    ) -> None:
         # get the number of tasks in job
         # try to match the appropriate pool for the tasks in job
         # add job to pool
@@ -1651,7 +1750,12 @@ class FederationProcessor():
                 await asyncio.sleep(1 + random.randint(0, 5))
 
     async def add_job_schedule_v1(
-            self, fedhash, job_schedule, constraints, unique_id):
+        self,
+        fedhash: str,
+        job_schedule: batchmodels.JobScheduleAddParameter,
+        constraints: Constraints,
+        unique_id: str
+    ) -> None:
         # ensure there is no existing job schedule. although this is checked
         # at submission time, a similarly named job schedule can be enqueued
         # multiple times before the action is dequeued
@@ -1660,7 +1764,7 @@ class FederationProcessor():
                 'job schedule {} already exists for fed {} uid={}'.format(
                     job_schedule.id, fedhash, unique_id))
             return
-        num_tasks = constraints['tasks_per_recurrence']
+        num_tasks = constraints.task.tasks_per_recurrence
         logger.debug(
             'attempting to match job schedule {} with {} tasks in fed {} '
             'uid={} constraints={}'.format(
@@ -1684,7 +1788,13 @@ class FederationProcessor():
             else:
                 await asyncio.sleep(1 + random.randint(0, 5))
 
-    async def _terminate_job(self, fedhash, job_id, is_job_schedule, entity):
+    async def _terminate_job(
+        self,
+        fedhash: str,
+        job_id: str,
+        is_job_schedule: bool,
+        entity: azure.cosmosdb.table.models.Entity,
+    ) -> None:
         if 'TerminateTimestamp' in entity:
             logger.debug(
                 '{} {} for fed {} has already been terminated '
@@ -1704,7 +1814,13 @@ class FederationProcessor():
         entity['TerminateTimestamp'] = datetime_utcnow(as_string=False)
         self.fdh.upsert_location_entity_for_job(entity)
 
-    async def _delete_job(self, fedhash, job_id, is_job_schedule, entity):
+    async def _delete_job(
+        self,
+        fedhash: str,
+        job_id: str,
+        is_job_schedule: bool,
+        entity: azure.cosmosdb.table.models.Entity,
+    ) -> None:
         logger.debug(
             'deleting {} {} on pool {} for fed {} (batch_account={} '
             'service_url={}'.format(
@@ -1717,7 +1833,13 @@ class FederationProcessor():
         self.fdh.delete_location_entity_for_job(entity)
 
     async def delete_or_terminate_job_v1(
-            self, delete, fedhash, job_id, is_job_schedule, unique_id):
+        self,
+        delete: bool,
+        fedhash: str,
+        job_id: str,
+        is_job_schedule: bool,
+        unique_id: str
+    ) -> None:
         # find all jobs across federation mathching the id
         entities = self.fdh.get_all_location_entities_for_job(fedhash, job_id)
         # terminate each pool-level job representing federation job
@@ -1736,7 +1858,6 @@ class FederationProcessor():
                     'delete' if delete else 'terminate',
                     'job schedule' if is_job_schedule else 'job',
                     job_id, fedhash, unique_id))
-            return
 
     async def process_message_action_v1(
         self,
@@ -1757,7 +1878,7 @@ class FederationProcessor():
         if target_type == 'job_schedule':
             if action == 'add':
                 job_schedule = data[target_type]['data']
-                constraints = data[target_type]['constraints']
+                constraints = Constraints(data[target_type]['constraints'])
                 await self.add_job_schedule_v1(
                     fedhash, job_schedule, constraints, unique_id)
             elif action == 'terminate':
@@ -1771,8 +1892,8 @@ class FederationProcessor():
         elif target_type == 'job':
             if action == 'add':
                 job = data[target_type]['data']
-                constraints = data[target_type]['constraints']
-                naming = data[target_type]['naming']
+                constraints = Constraints(data[target_type]['constraints'])
+                naming = TaskNaming(data[target_type]['task_naming'])
                 task_map = data['task_map']
                 await self.add_job_v1(
                     fedhash, job, constraints, naming, task_map, unique_id)
@@ -1932,6 +2053,7 @@ def main() -> None:
     with open(args.conf, 'rb') as f:
         config = json.load(f)
     logger.debug('loaded config from {}: {}'.format(args.conf, config))
+    del args
     # create federation processor
     fed_processor = FederationProcessor(config)
     # run the poller

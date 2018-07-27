@@ -78,16 +78,9 @@ _GPU_INSTANCES = _GPU_COMPUTE_INSTANCES.union(_GPU_VISUALIZATION_INSTANCES)
 _RDMA_INSTANCES = frozenset((
     # standard_a
     'standard_a8', 'standard_a9',
-    # standard_h
-    'standard_h16r', 'standard_h16mr',
-    # standard_nc
-    'standard_nc24r',
-    # standard_nc_v2
-    'standard_nc24rs_v2',
-    # standard_nc_v3
-    'standard_nc24rs_v3',
-    # standard_nd
-    'standard_nd24rs',
+))
+_RDMA_INSTANCE_SUFFIXES = frozenset((
+    'r', 'rs', 'rs_v2', 'rs_v3',
 ))
 _PREMIUM_STORAGE_INSTANCE_PREFIXES = frozenset((
     'standard_ds', 'standard_gs',
@@ -340,13 +333,14 @@ CustomMountFstabSettings = collections.namedtuple(
 )
 FederationPoolConstraintSettings = collections.namedtuple(
     'FederationPoolConstraintSettings', [
-        'native', 'windows', 'location', 'virtual_network_arm_id',
-        'low_priority_nodes_allow', 'low_priority_nodes_exclusive',
+        'native', 'windows', 'location', 'custom_image_arm_id',
+        'virtual_network_arm_id', 'low_priority_nodes_allow',
+        'low_priority_nodes_exclusive',
     ]
 )
 FederationComputeNodeConstraintSettings = collections.namedtuple(
     'FederationComputeNodeConstraintSettings', [
-        'cores', 'memory', 'gpu', 'infiniband',
+        'vm_size', 'cores', 'memory', 'gpu', 'infiniband',
     ]
 )
 FederationConstraintSettings = collections.namedtuple(
@@ -746,7 +740,10 @@ def is_rdma_pool(vm_size):
     :rtype: bool
     :return: if rdma is present
     """
-    if vm_size.lower() in _RDMA_INSTANCES:
+    vsl = vm_size.lower()
+    if vsl in _RDMA_INSTANCES:
+        return True
+    elif any(vsl.endswith(x) for x in _RDMA_INSTANCE_SUFFIXES):
         return True
     return False
 
@@ -758,11 +755,10 @@ def is_premium_storage_vm_size(vm_size):
     :rtype: bool
     :return: if vm size is premium storage compatible
     """
-    if any([vm_size.lower().endswith(x)
-            for x in _PREMIUM_STORAGE_INSTANCE_SUFFIXES]):
+    vsl = vm_size.lower()
+    if any(vsl.endswith(x) for x in _PREMIUM_STORAGE_INSTANCE_SUFFIXES):
         return True
-    elif any([vm_size.lower().startswith(x)
-              for x in _PREMIUM_STORAGE_INSTANCE_PREFIXES]):
+    elif any(vsl.startswith(x) for x in _PREMIUM_STORAGE_INSTANCE_PREFIXES):
         return True
     return False
 
@@ -3043,6 +3039,10 @@ def job_federation_constraint_settings(conf, federation_id):
     pool_location = _kv_read_checked(pool_conf, 'location')
     if pool_location is not None:
         pool_location = pool_location.lower()
+    pool_custom_image_arm_id = _kv_read_checked(
+        pool_conf, 'custom_image_arm_id')
+    if pool_custom_image_arm_id is not None:
+        pool_custom_image_arm_id = pool_custom_image_arm_id.lower()
     pool_virtual_network_arm_id = _kv_read_checked(
         pool_conf, 'virtual_network_arm_id')
     if pool_virtual_network_arm_id is not None:
@@ -3050,6 +3050,9 @@ def job_federation_constraint_settings(conf, federation_id):
     pool_lp_conf = _kv_read_checked(
         pool_conf, 'low_priority_nodes', default={})
     node_conf = _kv_read_checked(fc_conf, 'compute_node', default={})
+    vm_size = _kv_read_checked(node_conf, 'vm_size')
+    if vm_size is not None:
+        vm_size = vm_size.lower()
     node_memory = _kv_read_checked(node_conf, 'memory')
     if node_memory is not None:
         node_memory = node_memory.lower()
@@ -3063,9 +3066,10 @@ def job_federation_constraint_settings(conf, federation_id):
                 'non-positive value')
     return FederationConstraintSettings(
         pool=FederationPoolConstraintSettings(
-            native=_kv_read(pool_conf, 'native', default=False),
-            windows=_kv_read(pool_conf, 'windows', default=False),
+            native=_kv_read(pool_conf, 'native'),
+            windows=_kv_read(pool_conf, 'windows'),
             location=pool_location,
+            custom_image_arm_id=pool_custom_image_arm_id,
             virtual_network_arm_id=pool_virtual_network_arm_id,
             low_priority_nodes_allow=_kv_read(
                 pool_lp_conf, 'allow', default=True),
@@ -3073,6 +3077,7 @@ def job_federation_constraint_settings(conf, federation_id):
                 pool_lp_conf, 'exclusive', default=False),
         ),
         compute_node=FederationComputeNodeConstraintSettings(
+            vm_size=vm_size,
             cores=_kv_read(node_conf, 'cores'),
             memory=node_memory,
             gpu=_kv_read(node_conf, 'gpu'),
@@ -3230,15 +3235,17 @@ def set_task_id(conf, id):
     conf['id'] = id
 
 
-def task_settings(cloud_pool, config, poolconf, jobspec, conf):
+def task_settings(
+        cloud_pool, config, poolconf, jobspec, conf, federation_id=None):
     # type: (azure.batch.models.CloudPool, dict, PoolSettings, dict,
-    #        dict) -> TaskSettings
+    #        dict, str) -> TaskSettings
     """Get task settings
     :param azure.batch.models.CloudPool cloud_pool: cloud pool object
     :param dict config: configuration dict
     :param PoolSettings poolconf: pool settings
     :param dict jobspec: job specification
     :param dict conf: task configuration object
+    :param str federation_id: federation id
     :rtype: TaskSettings
     :return: task settings
     """
@@ -3297,6 +3304,18 @@ def task_settings(cloud_pool, config, poolconf, jobspec, conf):
                 image_reference.publisher.lower()
             offer = cloud_pool.virtual_machine_configuration.\
                 image_reference.offer.lower()
+    # get federation job constraint overrides
+    if util.is_not_empty(federation_id):
+        fed_constraints = job_federation_constraint_settings(
+            jobspec, federation_id)
+        native = fed_constraints.pool.native or native
+        is_windows = fed_constraints.pool.windows or is_windows
+        is_custom_image = util.is_not_empty(
+            fed_constraints.pool.custom_image_arm_id)
+        if is_multi_instance_task(conf):
+            inter_node_comm = True
+    else:
+        fed_constraints = None
     # get depends on
     try:
         depends_on = conf['depends_on']
@@ -3657,6 +3676,10 @@ def task_settings(cloud_pool, config, poolconf, jobspec, conf):
             gpu = True
         else:
             gpu = False
+    # adjust gpu with fed constraints
+    if (fed_constraints is not None and
+            fed_constraints.compute_node.gpu is not None):
+        gpu = fed_constraints.compute_node.gpu
     # adjust for gpu settings
     if gpu:
         if not is_gpu_pool(vm_size):
@@ -3682,6 +3705,17 @@ def task_settings(cloud_pool, config, poolconf, jobspec, conf):
             infiniband = True
         else:
             infiniband = False
+    # adjust gpu with fed constraints
+    if (fed_constraints is not None and
+            fed_constraints.compute_node.infiniband is not None):
+        infiniband = fed_constraints.compute_node.infiniband
+        # set publisher and offer (or node agent)
+        if infiniband:
+            if is_custom_image:
+                node_agent = 'batch.node.centos'
+            else:
+                publisher = 'openlogic'
+                offer = 'centos-hpc'
     # adjust for infiniband
     if infiniband:
         if not inter_node_comm:

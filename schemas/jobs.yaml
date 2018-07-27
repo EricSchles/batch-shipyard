@@ -161,14 +161,6 @@ mapping:
               pool:
                 type: map
                 mapping:
-                  native:
-                    type: bool
-                  windows:
-                    type: bool
-                  location:
-                    type: str
-                  virtual_network_arm_id:
-                    type: str
                   low_priority_nodes:
                     type: map
                     mapping:
@@ -178,9 +170,21 @@ mapping:
                       exclusive:
                         type: bool
                         required: true
+                  native:
+                    type: bool
+                  windows:
+                    type: bool
+                  location:
+                    type: str
+                  custom_image_arm_id:
+                    type: str
+                  virtual_network_arm_id:
+                    type: str
               compute_node:
                 type: map
                 mapping:
+                  vm_size:
+                    type: str
                   cores:
                     type: int
                   memory:

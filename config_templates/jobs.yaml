@@ -62,14 +62,16 @@ job_specifications:
   default_working_dir: batch
   federation_constraints:
     pool:
-      native: false
-      windows: false
-      location: eastus
-      virtual_network_arm_id: null
       low_priority_nodes:
         allow: true
         exclusive: false
+      native: false
+      windows: false
+      location: eastus
+      custom_image_arm_id: null
+      virtual_network_arm_id: null
     compute_node:
+      vm_size: STANDARD_F1
       cores: 2
       memory: 512m
       gpu: false

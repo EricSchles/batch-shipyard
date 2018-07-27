@@ -4175,6 +4175,7 @@ def _construct_task(
                     'CUDA_CACHE_DISABLE': '0',
                     'CUDA_CACHE_MAXSIZE': '1073741824',
                     # use absolute path due to non-expansion
+                    # TODO this will be mismatched if target is a federation
                     'CUDA_CACHE_PATH': (
                         '{}/batch/tasks/.nv/ComputeCache').format(tempdisk),
                 }
@@ -4530,6 +4531,14 @@ def add_jobs(
     lasttaskid = None
     tasksadded = False
     for jobspec in settings.job_specifications(config):
+        if util.is_not_empty(federation_id):
+            fed_constraints = settings.job_federation_constraint_settings(
+                jobspec, federation_id)
+            # set overrides from fed constraints
+            native = fed_constraints.pool.native or native
+            is_windows = fed_constraints.pool.windows or is_windows
+        else:
+            fed_constraints = None
         job_id = settings.job_id(jobspec)
         lastjob = job_id
         # perform checks:
@@ -4741,7 +4750,8 @@ def add_jobs(
                     batchmodels.OnAllTasksComplete.no_action
                 )
             # check pool settings for kill job on completion
-            if kill_job_on_completion:
+            if (kill_job_on_completion and
+                    util.is_none_or_empty(federation_id)):
                 if cloud_pool is not None:
                     total_vms = (
                         cloud_pool.current_dedicated_nodes +
@@ -5018,19 +5028,45 @@ def add_jobs(
                         'method': 'add',
                         'kind': kind,
                     },
-                    'job_schedule': {
+                    kind: {
                         'id': jobschedule.id,
                         'data': jobschedule,
                         'constraints': {
-                            'has_multi_instance': multi_instance,
-                            'native': native,
-                            'windows': is_windows,
-                            'tasks_per_recurrence': len(task_map),
+                            'pool': {
+                                'custom_image_arm_id':
+                                fed_constraints.pool.custom_image_arm_id,
+                                'location': fed_constraints.pool.location,
+                                'low_priority_nodes_allow':
+                                fed_constraints.pool.low_priority_nodes_allow,
+                                'low_priority_nodes_exclusive':
+                                fed_constraints.pool.
+                                low_priority_nodes_exclusive,
+                                'native': native,
+                                'virtual_network_arm_id':
+                                fed_constraints.pool.virtual_network_arm_id,
+                                'windows': is_windows,
+                            },
+                            'compute_node': {
+                                'vm_size':
+                                fed_constraints.compute_node.vm_size,
+                                'cores':
+                                fed_constraints.compute_node.cores,
+                                'memory':
+                                fed_constraints.compute_node.memory,
+                                'gpu':
+                                fed_constraints.compute_node.gpu,
+                                'infiniband':
+                                fed_constraints.compute_node.infiniband,
+                            },
+                            'task': {
+                                'has_multi_instance': multi_instance,
+                                'tasks_per_recurrence': len(task_map),
+                            },
                         },
                     },
                 }
                 if has_merge_task:
-                    info['job_schedule']['constraints']['merge_task'] = (
+                    info[kind]['constraints']['task']['merge_task_id'] = (
                         merge_task_id
                     )
                 # pickle json and upload
@@ -5082,16 +5118,42 @@ def add_jobs(
                         'method': 'add',
                         'kind': kind,
                     },
-                    'job': {
+                    kind: {
                         'id': job_id,
                         'data': job,
                         'constraints': {
-                            'auto_complete': auto_complete,
-                            'has_multi_instance': multi_instance,
-                            'native': native,
-                            'windows': is_windows,
+                            'pool': {
+                                'custom_image_arm_id':
+                                fed_constraints.pool.custom_image_arm_id,
+                                'location': fed_constraints.pool.location,
+                                'low_priority_nodes_allow':
+                                fed_constraints.pool.low_priority_nodes_allow,
+                                'low_priority_nodes_exclusive':
+                                fed_constraints.pool.
+                                low_priority_nodes_exclusive,
+                                'native': native,
+                                'virtual_network_arm_id':
+                                fed_constraints.pool.virtual_network_arm_id,
+                                'windows': is_windows,
+                            },
+                            'compute_node': {
+                                'vm_size':
+                                fed_constraints.compute_node.vm_size,
+                                'cores':
+                                fed_constraints.compute_node.cores,
+                                'memory':
+                                fed_constraints.compute_node.memory,
+                                'gpu':
+                                fed_constraints.compute_node.gpu,
+                                'infiniband':
+                                fed_constraints.compute_node.infiniband,
+                            },
+                            'task': {
+                                'auto_complete': auto_complete,
+                                'has_multi_instance': multi_instance,
+                            },
                         },
-                        'naming': {
+                        'task_naming': {
                             'prefix': settings.autogenerated_task_id_prefix(
                                 config),
                             'padding': settings.autogenerated_task_id_zfill(
@@ -5101,7 +5163,8 @@ def add_jobs(
                     'task_map': task_map,
                 }
                 if has_merge_task:
-                    info['job']['constraints']['merge_task'] = merge_task_id
+                    info[kind]['constraints']['task']['merge_task_id'] = \
+                        merge_task_id
                 # pickle json and upload
                 unique_id = uuid.uuid4()
                 jloc = 'messages/{}.pickle'.format(unique_id)
