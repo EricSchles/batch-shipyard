@@ -72,6 +72,10 @@ _RDMA_INSTANCES = frozenset((
 _RDMA_INSTANCE_SUFFIXES = frozenset((
     'r', 'rs', 'rs_v2', 'rs_v3',
 ))
+_GPU_INSTANCE_PREFIXES = frozenset((
+    'standard_nc', 'standard_nd', 'standard_nv',
+))
+_POOL_NATIVE_METADATA_NAME = 'BATCH_SHIPYARD_NATIVE_CONTAINER_POOL'
 
 
 def _setup_logger() -> None:
@@ -152,6 +156,15 @@ def is_rdma_pool(vm_size: str) -> bool:
     return False
 
 
+def is_gpu_pool(vm_size: str) -> bool:
+    """Check if pool is GPU capable
+    :param str vm_size: vm size
+    :return: if gpus are present
+    """
+    vsl = vm_size.lower()
+    return any(vsl.startswith(x) for x in _GPU_INSTANCE_PREFIXES)
+
+
 class PoolConstraints():
     def __init__(self, constraints: Dict[str, Any]) -> None:
         self.custom_image_arm_id = constraints.get('custom_image_arm_id')
@@ -168,7 +181,20 @@ class ComputeNodeConstraints():
     def __init__(self, constraints: Dict[str, Any]) -> None:
         self.vm_size = constraints.get('vm_size')
         self.cores = constraints.get('cores')
+        if self.cores is not None:
+            self.cores = int(self.cores)
         self.memory = constraints.get('memory')
+        if self.memory is not None:
+            suffix = self.memory[-1].lower()
+            value = int(self.memory[:-1])
+            multiplier = 1
+            if suffix == 'k':
+                multiplier = 1024
+            elif suffix == 'm':
+                multiplier = 1024 * 1024
+            elif suffix == 'g':
+                multiplier = 1024 * 1024 * 1024
+            self.memory = value * multiplier
         self.gpu = constraints.get('gpu')
         self.infiniband = constraints.get('infiniband')
 
@@ -1169,13 +1195,13 @@ class FederationPool():
     ) -> None:
         self.batch_account = batch_account
         self.service_url = service_url
-        self.location = location
+        self.location = location.lower()
         self.pool_id = pool_id
         self.cloud_pool = cloud_pool
-        self.node_counts = None
-        self.node_counts_refresh_epoch = None
+        self.node_counts = None  # type: batchmodels.PoolNodeCounts
+        self.node_counts_refresh_epoch = None  # type: str
         self.vm_props = vm_size
-        self._vm_size = None
+        self._vm_size = None  # type: str
         self.last_update_time = datetime_utcnow()
         if self.is_valid:
             self._vm_size = self.cloud_pool.vm_size.lower()
@@ -1195,6 +1221,16 @@ class FederationPool():
         )
 
     @property
+    def native(self) -> Optional[bool]:
+        if not self.is_valid:
+            return None
+        if is_not_empty(self.cloud_pool.metadata):
+            for md in self.cloud_pool.metadata:
+                if md.name == _POOL_NATIVE_METADATA_NAME:
+                    return md.value == '1'
+        return False
+
+    @property
     def vm_size(self) -> Optional[str]:
         return self._vm_size
 
@@ -1203,31 +1239,18 @@ class FederationPool():
         return self.cloud_pool.enable_inter_node_communication
 
     @property
-    def is_gpu(self) -> bool:
-        if self.vm_size.startswith('standard_n'):
-            return True
-        return False
+    def schedulable_low_priority_nodes(self) -> Optional[int]:
+        if not self.is_valid or self.node_counts is None:
+            return None
+        return (self.node_counts.low_priority.idle +
+                self.node_counts.low_priority.running)
 
     @property
-    def is_rdma(self) -> bool:
-        if (self.vm_size.endswith('r') or
-                self.vm_size.endswith('rs') or
-                self.vm_size.endswith('rs_v2') or
-                self.vm_size.endswith('rs_v3') or
-                self.vm_size == 'standard_a8' or
-                self.vm_size == 'standard_a9'):
-            return True
-        return False
-
-    @property
-    def is_premium(self) -> bool:
-        if (self.vm_size.endswith('s') or
-                self.vm_size.endswith('s_v2') or
-                self.vm_size.endswith('s_v3') or
-                self.vm_size.startswith('standard_ds') or
-                self.vm_size.startswith('standard_gs')):
-            return True
-        return False
+    def schedulable_dedicated_nodes(self) -> Optional[int]:
+        if not self.is_valid or self.node_counts is None:
+            return None
+        return (self.node_counts.dedicated.idle +
+                self.node_counts.dedicated.running)
 
 
 class Federation():
@@ -1291,42 +1314,177 @@ class Federation():
             logger.info('active pools in federation {} id={}: {}'.format(
                 self.hash, self.id, ' '.join(self.pools.keys())))
 
-    def _filter_pool_with_constraints(
+    def _log_constraint_failure(
+            self,
+            unique_id: str,
+            pool_id: str,
+            constraint_name: str,
+            required_value: Any,
+            actual_value: Any,
+    ) -> None:
+        logger.debug(
+            'constraint failure for uid {} on pool {} for fed id {} '
+            'fed hash {}: {} requires {} actual {}'.format(
+                unique_id, pool_id, self.id, self.hash, constraint_name,
+                required_value, actual_value)
+        )
+
+    def _filter_pool_with_hard_constraints(
+            self,
+            pool: FederationPool,
+            constraints: Constraints,
+            unique_id: str,
+    ) -> bool:
+        # constraint order matching
+        # 0. pool validity
+        # 1. location
+        # 2. virtual network arm id
+        # 3. custom image arm id
+        # 4. windows (implies native)
+        # 5. native
+        # 6. low priority dis-allow
+        # 7. low priority exclusive
+        # 8. vm_size
+        # 9. cores
+        # 10. memory
+        # 11. gpu
+        # 12. infiniband
+        # 13. multi instance -> inter node
+
+        cp = pool.cloud_pool
+        # pool validity (this function shouldn't be called with invalid
+        # pools, but check anyways)
+        if not pool.is_valid:
+            logger.debug(
+                'pool {} is not valid for filtering of uid {} for fed id {} '
+                'fed hash {}'.format(cp.id, unique_id, self.id, self.hash))
+            return True
+        # location
+        if (is_not_empty(constraints.pool.location) and
+                constraints.pool.location != pool.location):
+            self._log_constraint_failure(
+                unique_id, cp.id, 'location', constraints.pool.location,
+                pool.location)
+            return True
+        # virtual network
+        if (is_not_empty(constraints.pool.virtual_network_arm_id) and
+                (cp.network_configuration is None or
+                 constraints.pool.virtual_network_arm_id !=
+                 cp.network_configuration.subnet_id.lower())):
+            self._log_constraint_failure(
+                unique_id, cp.id, 'virtual_network_arm_id',
+                constraints.pool.virtual_network_arm_id,
+                cp.network_configuration.subnet_id
+                if cp.network_configuration is not None else 'none')
+            return True
+        # custom image
+        if (is_not_empty(constraints.pool.custom_image_arm_id) and
+                (cp.virtual_machine_configuration is None or
+                 constraints.pool.custom_image_arm_id !=
+                 cp.virtual_machine_configuration.image_reference.
+                 virtual_machine_image_id.lower())):
+            self._log_constraint_failure(
+                unique_id, cp.id, 'custom_image_arm_id',
+                constraints.pool.custom_image_arm_id,
+                cp.virtual_machine_configuration.image_reference.
+                virtual_machine_image_id
+                if cp.virtual_machine_configuration is not None else 'none')
+            return True
+        # windows
+        if (constraints.pool.windows and
+                (cp.virtual_machine_configuration is None or
+                 not cp.virtual_machine_configuration.node_agent_sku_id.
+                 startswith('batch.node.windows'))):
+            self._log_constraint_failure(
+                unique_id, cp.id, 'windows',
+                constraints.pool.windows,
+                cp.virtual_machine_configuration.node_agent_sku_id)
+            return True
+        # native
+        if constraints.pool.native and not pool.native:
+            self._log_constraint_failure(
+                unique_id, cp.id, 'native',
+                constraints.pool.native, False)
+            return True
+        # low priority (dis)allow
+        if (constraints.pool.low_priority_nodes_allow is not None and
+                not constraints.pool.low_priority_nodes_allow and
+                cp.target_low_priority_nodes > 0 and
+                not cp.enable_auto_scale):
+            self._log_constraint_failure(
+                unique_id, cp.id, 'low_priority_nodes_allow',
+                constraints.pool.low_priority_nodes_allow,
+                cp.target_low_priority_nodes)
+            return True
+        # low priority exclusive
+        if (constraints.pool.low_priority_nodes_exclusive and
+                cp.target_low_priority_nodes == 0 and
+                not cp.enable_auto_scale):
+            self._log_constraint_failure(
+                unique_id, cp.id, 'low_priority_nodes_exclusive',
+                constraints.pool.low_priority_nodes_exclusive,
+                cp.target_low_priority_nodes)
+            return True
+        # vm size
+        if (is_not_empty(constraints.compute_node.vm_size) and
+                constraints.compute_node.vm_size != pool.vm_size):
+            self._log_constraint_failure(
+                unique_id, cp.id, 'vm_size',
+                constraints.compute_node.vm_size,
+                pool.vm_size)
+            return True
+        # cores
+        if (constraints.compute_node.cores is not None and
+                pool.vm_props is not None and
+                constraints.compute_node.cores >
+                pool.vm_props.number_of_cores):
+            self._log_constraint_failure(
+                unique_id, cp.id, 'cores',
+                constraints.compute_node.cores,
+                pool.vm_props.number_of_cores)
+            return True
+        # memory
+        if (constraints.compute_node.memory is not None and
+                pool.vm_props is not None):
+            vm_mem = pool.vm_props.memory_in_mb * 1024 * 1024
+            if constraints.compute_node.memory > vm_mem:
+                self._log_constraint_failure(
+                    unique_id, cp.id, 'memory',
+                    constraints.compute_node.memory,
+                    vm_mem)
+                return True
+        # gpu
+        if constraints.compute_node.gpu and not is_gpu_pool(pool.vm_size):
+            self._log_constraint_failure(
+                unique_id, cp.id, 'gpu',
+                constraints.compute_node.gpu, False)
+            return True
+        # infiniband
+        if (constraints.compute_node.infiniband and
+                not is_rdma_pool(pool.vm_size)):
+            self._log_constraint_failure(
+                unique_id, cp.id, 'infiniband',
+                constraints.compute_node.infiniband, False)
+            return True
+        # multi-instance
+        if (constraints.task.has_multi_instance and
+                not cp.enable_inter_node_communication):
+            self._log_constraint_failure(
+                unique_id, cp.id, 'has_multi_instance',
+                constraints.task.has_multi_instance,
+                cp.enable_inter_node_communication)
+            return True
+        # hard constraint filtering passed
+        return False
+
+    def _filter_pool_nodes_with_constraints(
             self,
             pool: FederationPool,
             constraints: Constraints,
             unique_id: str,
     ) -> bool:
         cp = pool.cloud_pool
-        # multi-instance
-        if (constraints.task.has_multi_instance and
-                not cp.enable_inter_node_communication):
-            logger.debug(
-                'uid {} incompatible with pool {} due to multi-instance and '
-                'internode comm'.format(unique_id, cp.id))
-            return True
-        # native
-        if constraints.pool.native:
-            native = False
-            for md in cp.metadata:
-                if md.name == 'BATCH_SHIPYARD_NATIVE_CONTAINER_POOL':
-                    native = md.value == '1'
-                    break
-            if not native:
-                logger.debug(
-                    'uid {} incompatible with pool {} due to native '
-                    'mode requirement'.format(unique_id, cp.id))
-                return True
-        # windows
-        if (constraints.pool.windows and
-                cp.virtual_machine_configuration.node_agent_sku_id.lower() !=
-                'batch.node.windows amd64'):
-            logger.debug(
-                'uid {} incompatible with pool {} due to windows '
-                'requirement'.format(unique_id, cp.id))
-            return True
-        # filtering passed
-        return False
+        # TODO pickup here
 
     def find_target_pool_for_job(
             self,
@@ -1345,6 +1503,7 @@ class Federation():
         idle_dedicated_vms = {}
         idle_lowpriority_vms = {}
         # TODO Parallelize
+        # TODO optimization -> fast match against last schedule?
         for rk in self.pools:
             if rk in blacklist:
                 continue
@@ -1355,8 +1514,8 @@ class Federation():
                     pool.batch_account, pool.service_url, pool.pool_id)
                 if not pool.is_valid:
                     continue
-            # contraint filtering
-            if self._filter_pool_with_constraints(
+            # hard constraint filtering
+            if self._filter_pool_with_hard_constraints(
                     pool, constraints, unique_id):
                 blacklist.add(rk)
                 continue
@@ -1365,6 +1524,12 @@ class Federation():
                 pool.node_counts = bsh.get_node_state_counts(
                     pool.batch_account, pool.service_url, pool.pool_id)
                 pool.node_counts_refresh_epoch = unique_id
+            # further constraint matching for nodes
+            if self._filter_pool_nodes_with_constraints(
+                    pool, constraints, unique_id):
+                # TODO pickup here
+                pass
+
             # add counts for pre-sort
             if pool.node_counts.dedicated.idle > 0:
                 idle_dedicated_vms[rk] = pool.node_counts.dedicated.idle
@@ -1599,7 +1764,7 @@ class Federation():
         pool = self.pools[target_pool]
         # check if there is an ib mismatch
         ib_mismatch = None
-        if is_rdma_pool(pool.cloud_pool.vm_size):
+        if is_rdma_pool(pool.vm_size):
             na = pool.cloud_pool.node_agent_sku_id.lower()
             if na.startswith('batch.node.ubuntu'):
                 ib_mismatch = 'ubuntu'
@@ -2075,9 +2240,8 @@ def main() -> None:
             logger.exception(str(exc))
 
 
-def parseargs():
+def parseargs() -> argparse.Namespace:
     """Parse program arguments
-    :rtype: argparse.Namespace
     :return: parsed arguments
     """
     parser = argparse.ArgumentParser(

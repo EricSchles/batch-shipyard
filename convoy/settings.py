@@ -3053,7 +3053,16 @@ def job_federation_constraint_settings(conf, federation_id):
     vm_size = _kv_read_checked(node_conf, 'vm_size')
     if vm_size is not None:
         vm_size = vm_size.lower()
+    node_cores = _kv_read(node_conf, 'cores')
+    if util.is_not_empty(vm_size) and node_cores is not None:
+        raise ValueError(
+            'cannot specify both vm_size and cores for compute_node '
+            'constraint')
     node_memory = _kv_read_checked(node_conf, 'memory')
+    if util.is_not_empty(vm_size) and node_memory is not None:
+        raise ValueError(
+            'cannot specify both vm_size and memory for compute_node '
+            'constraint')
     if node_memory is not None:
         node_memory = node_memory.lower()
         if node_memory[-1] not in ('b', 'k', 'm', 'g'):
@@ -3064,6 +3073,15 @@ def job_federation_constraint_settings(conf, federation_id):
             raise ValueError(
                 'federation_constraints:compute_node:memory is a '
                 'non-positive value')
+    node_gpu = _kv_read(node_conf, 'gpu')
+    if node_gpu and util.is_not_empty(vm_size) and not is_gpu_pool(vm_size):
+        raise ValueError(
+            'cannot specify gpu=True while vm_size does not have GPUs')
+    node_ib = _kv_read(node_conf, 'infiniband')
+    if node_ib and util.is_not_empty(vm_size) and not is_rdma_pool(vm_size):
+        raise ValueError(
+            'cannot specify infiniband=True while vm_size does not have '
+            'RDMA/IB')
     return FederationConstraintSettings(
         pool=FederationPoolConstraintSettings(
             native=_kv_read(pool_conf, 'native'),
@@ -3078,10 +3096,10 @@ def job_federation_constraint_settings(conf, federation_id):
         ),
         compute_node=FederationComputeNodeConstraintSettings(
             vm_size=vm_size,
-            cores=_kv_read(node_conf, 'cores'),
+            cores=node_cores,
             memory=node_memory,
-            gpu=_kv_read(node_conf, 'gpu'),
-            infiniband=_kv_read(node_conf, 'infiniband'),
+            gpu=node_gpu,
+            infiniband=node_ib,
         ),
     )
 
