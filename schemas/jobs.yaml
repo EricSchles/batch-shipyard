@@ -161,6 +161,15 @@ mapping:
               pool:
                 type: map
                 mapping:
+                  autoscale:
+                    type: map
+                    mapping:
+                      allow:
+                        type: bool
+                        required: true
+                      exclusive:
+                        type: bool
+                        required: true
                   low_priority_nodes:
                     type: map
                     mapping:
@@ -186,9 +195,23 @@ mapping:
                   vm_size:
                     type: str
                   cores:
-                    type: int
+                    type: map
+                    mapping:
+                      amount:
+                        type: int
+                        required: true
+                      schedulable_variance:
+                        type: float
                   memory:
-                    type: str
+                    type: map
+                    mapping:
+                      amount:
+                        type: str
+                        required: true
+                      schedulable_variance:
+                        type: float
+                  exclusive:
+                    type: bool
                   gpu:
                     type: bool
                   infiniband:

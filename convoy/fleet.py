@@ -4679,7 +4679,9 @@ def action_fed_jobs_del_or_term(
                 'cannot specify both --all-jobschedules and --jobscheduleid')
     else:
         if jobid is None and jobscheduleid is None:
-            raise ValueError('no valid option specified')
+            raise ValueError(
+                'no valid option specified, please run command with -h to '
+                'see options')
     storage.delete_or_terminate_job_from_federation(
         blob_client, table_client, queue_client, delete, federation_id, jobid,
         jobscheduleid, all_jobs, all_jobschedules)

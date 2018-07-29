@@ -66,6 +66,7 @@ logger = logging.getLogger(__name__)
 # global defines
 _MAX_EXECUTOR_WORKERS = min((multiprocessing.cpu_count() * 4, 32))
 _MAX_TIMESPAN_POOL_UPDATE = datetime.timedelta(seconds=60)
+_MAX_TIMESPAN_NODE_COUNTS_UPDATE = datetime.timedelta(seconds=30)
 _RDMA_INSTANCES = frozenset((
     'standard_a8', 'standard_a9',
 ))
@@ -158,32 +159,51 @@ def is_rdma_pool(vm_size: str) -> bool:
 
 def is_gpu_pool(vm_size: str) -> bool:
     """Check if pool is GPU capable
-    :param str vm_size: vm size
+    :param vm_size: vm size
     :return: if gpus are present
     """
     vsl = vm_size.lower()
     return any(vsl.startswith(x) for x in _GPU_INSTANCE_PREFIXES)
 
 
+def get_temp_disk_for_node_agent(node_agent: str) -> str:
+    """Get temp disk location for node agent
+    :param node_agent: node agent
+    :return: temp disk location
+    """
+    if node_agent.startswith('batch.node.unbuntu'):
+        return '/mnt'
+    elif node_agent.startswith('batch.node.windows'):
+        return 'D:\\batch'
+    else:
+        return '/mnt/resource'
+
+
 class PoolConstraints():
     def __init__(self, constraints: Dict[str, Any]) -> None:
+        autoscale = constraints.get('autoscale', {})
+        self.autoscale_allow = autoscale.get('allow')
+        self.autoscale_exclusive = autoscale.get('exclusive')
         self.custom_image_arm_id = constraints.get('custom_image_arm_id')
         self.location = constraints.get('location')
-        self.low_priority_nodes_allow = constraints('low_priority_nodes_allow')
-        self.low_priority_nodes_exclusive = constraints(
-            'low_priority_nodes_exclusive')
+        lp = constraints.get('low_priority', {})
+        self.low_priority_nodes_allow = lp.get('allow')
+        self.low_priority_nodes_exclusive = lp.get('exclusive')
         self.native = constraints.get('native')
-        self.virtual_network_arm_id = constraints('virtual_network_arm_id')
+        self.virtual_network_arm_id = constraints.get('virtual_network_arm_id')
         self.windows = constraints.get('windows')
 
 
 class ComputeNodeConstraints():
     def __init__(self, constraints: Dict[str, Any]) -> None:
         self.vm_size = constraints.get('vm_size')
-        self.cores = constraints.get('cores')
+        cores = constraints.get('cores', {})
+        self.cores = cores.get('amount')
         if self.cores is not None:
             self.cores = int(self.cores)
-        self.memory = constraints.get('memory')
+        self.core_variance = cores.get('schedulable_variance')
+        memory = constraints.get('memory', {})
+        self.memory = memory.get('memory')
         if self.memory is not None:
             suffix = self.memory[-1].lower()
             value = int(self.memory[:-1])
@@ -195,6 +215,8 @@ class ComputeNodeConstraints():
             elif suffix == 'g':
                 multiplier = 1024 * 1024 * 1024
             self.memory = value * multiplier
+        self.memory_variance = memory.get('schedulable_variance')
+        self.exclusive = constraints.get('exclusive')
         self.gpu = constraints.get('gpu')
         self.infiniband = constraints.get('infiniband')
 
@@ -203,6 +225,9 @@ class TaskConstraints():
     def __init__(self, constraints: Dict[str, Any]) -> None:
         self.auto_complete = constraints.get('auto_complete')
         self.has_multi_instance = constraints.get('has_multi_instance')
+        instance_counts = constraints.get('instance_counts', {})
+        self.instance_counts_max = instance_counts.get('max')
+        self.instance_counts_total = instance_counts.get('total')
         self.merge_task_id = constraints.get('merge_task_id')
         self.tasks_per_recurrence = constraints.get('tasks_per_recurrence')
 
@@ -1193,18 +1218,37 @@ class FederationPool():
             cloud_pool: batchmodels.CloudPool,
             vm_size: 'azure.mgmt.compute.models.VirtualMachineSize'
     ) -> None:
+        self._vm_size = None  # type: str
+        self._cloud_pool = None  # type: batchmodels.CloudPool
+        self._pool_last_update_time = None  # type: datetime.datetime
+        self._node_counts = None  # type: batchmodels.PoolNodeCounts
+        self._node_counts_last_update_time = None  # type: datetime.datetime
         self.batch_account = batch_account
         self.service_url = service_url
         self.location = location.lower()
         self.pool_id = pool_id
         self.cloud_pool = cloud_pool
-        self.node_counts = None  # type: batchmodels.PoolNodeCounts
-        self.node_counts_refresh_epoch = None  # type: str
         self.vm_props = vm_size
-        self._vm_size = None  # type: str
-        self.last_update_time = datetime_utcnow()
         if self.is_valid:
             self._vm_size = self.cloud_pool.vm_size.lower()
+
+    @property
+    def cloud_pool(self) -> batchmodels.CloudPool:
+        return self._cloud_pool
+
+    @cloud_pool.setter
+    def cloud_pool(self, value: batchmodels.CloudPool) -> None:
+        self._cloud_pool = value
+        self._last_update_time = datetime_utcnow()
+
+    @property
+    def node_counts(self) -> batchmodels.PoolNodeCounts:
+        return self._node_counts
+
+    @node_counts.setter
+    def node_counts(self, value: batchmodels.PoolNodeCounts) -> None:
+        self._node_counts = value
+        self._node_counts_last_update_time = datetime_utcnow()
 
     @property
     def is_valid(self) -> bool:
@@ -1213,11 +1257,21 @@ class FederationPool():
         return False
 
     @property
-    def requires_update(self) -> bool:
+    def pool_requires_update(self) -> bool:
         return (
-            not self.is_valid or
-            (datetime_utcnow() - self.last_update_time) >
+            not self.is_valid or self._pool_last_update_time is None or
+            (datetime_utcnow() - self._pool_last_update_time) >
             _MAX_TIMESPAN_POOL_UPDATE
+        )
+
+    @property
+    def node_counts_requires_update(self) -> bool:
+        if not self.is_valid:
+            return False
+        return (
+            self._node_counts_last_update_time is None or
+            (datetime_utcnow() - self._node_counts_last_update_time) >
+            _MAX_TIMESPAN_NODE_COUNTS_UPDATE
         )
 
     @property
@@ -1342,14 +1396,17 @@ class Federation():
         # 3. custom image arm id
         # 4. windows (implies native)
         # 5. native
-        # 6. low priority dis-allow
-        # 7. low priority exclusive
-        # 8. vm_size
-        # 9. cores
-        # 10. memory
-        # 11. gpu
-        # 12. infiniband
-        # 13. multi instance -> inter node
+        # 6. autoscale disallow
+        # 7. autoscale exclusive
+        # 8. low priority disallow
+        # 9. low priority exclusive
+        # 10. exclusive
+        # 11. vm_size
+        # 12. cores
+        # 13. memory
+        # 14. gpu
+        # 15. infiniband
+        # 16. multi instance -> inter node
 
         cp = pool.cloud_pool
         # pool validity (this function shouldn't be called with invalid
@@ -1406,7 +1463,24 @@ class Federation():
                 unique_id, cp.id, 'native',
                 constraints.pool.native, False)
             return True
-        # low priority (dis)allow
+        # autoscale disallow
+        if (constraints.pool.autoscale_allow is not None and
+                not constraints.pool.autoscale_allow and
+                cp.enable_auto_scale):
+            self._log_constraint_failure(
+                unique_id, cp.id, 'autoscale_allow',
+                constraints.pool.autoscale_allow,
+                cp.enable_auto_scale)
+            return True
+        # autoscale exclusive
+        if (constraints.pool.autoscale_exclusive and
+                not cp.enable_auto_scale):
+            self._log_constraint_failure(
+                unique_id, cp.id, 'autoscale_exclusive',
+                constraints.pool.autoscale_exclusive,
+                cp.enable_auto_scale)
+            return True
+        # low priority disallow
         if (constraints.pool.low_priority_nodes_allow is not None and
                 not constraints.pool.low_priority_nodes_allow and
                 cp.target_low_priority_nodes > 0 and
@@ -1425,6 +1499,13 @@ class Federation():
                 constraints.pool.low_priority_nodes_exclusive,
                 cp.target_low_priority_nodes)
             return True
+        # exclusive
+        if constraints.compute_node.exclusive and cp.max_tasks_per_node > 1:
+            self._log_constraint_failure(
+                unique_id, cp.id, 'exclusive',
+                constraints.compute_node.exclusive,
+                cp.max_tasks_per_node)
+            return True
         # vm size
         if (is_not_empty(constraints.compute_node.vm_size) and
                 constraints.compute_node.vm_size != pool.vm_size):
@@ -1435,24 +1516,66 @@ class Federation():
             return True
         # cores
         if (constraints.compute_node.cores is not None and
-                pool.vm_props is not None and
-                constraints.compute_node.cores >
-                pool.vm_props.number_of_cores):
-            self._log_constraint_failure(
-                unique_id, cp.id, 'cores',
-                constraints.compute_node.cores,
-                pool.vm_props.number_of_cores)
-            return True
+                pool.vm_props is not None):
+            # absolute core filtering
+            if constraints.compute_node.cores > pool.vm_props.number_of_cores:
+                self._log_constraint_failure(
+                    unique_id, cp.id, 'cores',
+                    constraints.compute_node.cores,
+                    pool.vm_props.number_of_cores)
+                return True
+            # core variance of zero must match the number of cores exactly
+            if constraints.compute_node.core_variance == 0:
+                if (constraints.compute_node.cores !=
+                        pool.vm_props.number_of_cores):
+                    self._log_constraint_failure(
+                        unique_id, cp.id, 'zero core_variance',
+                        constraints.compute_node.cores,
+                        pool.vm_props.number_of_cores)
+                    return True
+            # core variance of None corresponds to no restrictions
+            # positive core variance infers maximum core matching
+            if (constraints.compute_node.core_variance is not None and
+                    constraints.compute_node.core_variance > 0):
+                max_cc = constraints.compute_node.cores * (
+                    1 + constraints.compute_node.core_variance)
+                if pool.vm_props.number_of_cores > max_cc:
+                    self._log_constraint_failure(
+                        unique_id, cp.id, 'max core_variance',
+                        max_cc,
+                        pool.vm_props.number_of_cores)
+                    return True
         # memory
         if (constraints.compute_node.memory is not None and
                 pool.vm_props is not None):
             vm_mem = pool.vm_props.memory_in_mb * 1024 * 1024
+            # absolute memory filtering
             if constraints.compute_node.memory > vm_mem:
                 self._log_constraint_failure(
                     unique_id, cp.id, 'memory',
                     constraints.compute_node.memory,
                     vm_mem)
                 return True
+            # memory variance of zero must match the memory amount exactly
+            if constraints.compute_node.memory_variance == 0:
+                if constraints.compute_node.memory != vm_mem:
+                    self._log_constraint_failure(
+                        unique_id, cp.id, 'zero memory_variance',
+                        constraints.compute_node.memory,
+                        vm_mem)
+                    return True
+            # memory variance of None corresponds to no restrictions
+            # positive memory variance infers maximum memory matching
+            if (constraints.compute_node.memory_variance is not None and
+                    constraints.compute_node.memory_variance > 0):
+                max_mem = constraints.compute_node.memory * (
+                    1 + constraints.compute_node.memory_variance)
+                if vm_mem > max_mem:
+                    self._log_constraint_failure(
+                        unique_id, cp.id, 'max memory_variance',
+                        max_mem,
+                        vm_mem)
+                    return True
         # gpu
         if constraints.compute_node.gpu and not is_gpu_pool(pool.vm_size):
             self._log_constraint_failure(
@@ -1484,7 +1607,208 @@ class Federation():
             unique_id: str,
     ) -> bool:
         cp = pool.cloud_pool
-        # TODO pickup here
+        # check for dedicated only execution
+        if (constraints.pool.low_priority_nodes_allow is not None and
+                not constraints.pool.low_priority_nodes_allow):
+            # if there are no schedulable dedicated nodes and
+            # if no autoscale is allowed or no autoscale formula exists
+            if ((pool.schedulable_low_priority_nodes > 0 or
+                 pool.schedulable_dedicated_nodes == 0) and
+                    (not (constraints.pool.autoscale_allow and
+                          cp.enable_auto_scale))):
+                self._log_constraint_failure(
+                    unique_id, cp.id, 'low_priority_nodes_allow',
+                    constraints.pool.low_priority_nodes_allow,
+                    pool.schedulable_dedicated_nodes)
+                return True
+        # check for low priority only execution
+        if constraints.pool.low_priority_nodes_exclusive:
+            # if there are no schedulable low pri nodes and
+            # if no autoscale is allowed or no autoscale formula exists
+            if ((pool.schedulable_low_priority_nodes == 0 or
+                 pool.schedulable_dedicated_nodes > 0) and
+                    (not (constraints.pool.autoscale_allow and
+                          cp.enable_auto_scale))):
+                self._log_constraint_failure(
+                    unique_id, cp.id, 'low_priority_nodes_allow',
+                    constraints.pool.low_priority_nodes_allow,
+                    pool.schedulable_dedicated_nodes)
+                return True
+        # node constraint filtering passed
+        return False
+
+    def _select_pool_for_target_required(
+            self,
+            target_required: int,
+            allow_autoscale: bool,
+            num_pools: Dict[str, int],
+            binned: List[str],
+            pool_map: Dict[str, Dict[str, int]],
+    ) -> Optional[str]:
+        # try to match against largest idle pool with sufficient capacity
+        if num_pools['idle'] > 0:
+            for rk in binned['idle']:
+                if pool_map['idle'][rk] >= target_required:
+                    return rk
+        # try to match against largest avail pool with sufficient capacity
+        if num_pools['avail'] > 0:
+            for rk in binned['avail']:
+                if pool_map['avail'][rk] >= target_required:
+                    return rk
+        # try to match against any autoscale-enabled pool that is not resizing
+        if allow_autoscale:
+            for rk in binned['idle']:
+                pool = self.pools[rk]
+                if (pool.cloud_pool.enable_auto_scale and
+                        pool.cloud_pool.allocation_state !=
+                        batchmodels.AllocationState.resizing):
+                    return rk
+            for rk in binned['avail']:
+                pool = self.pools[rk]
+                if (pool.cloud_pool.enable_auto_scale and
+                        pool.cloud_pool.allocation_state !=
+                        batchmodels.AllocationState.resizing):
+                    return rk
+        return None
+
+    def _greedy_best_fit_match_for_job(
+            self,
+            num_tasks: int,
+            constraints: Constraints,
+            unique_id: str,
+            dedicated_vms: Dict[str, Dict[str, int]],
+            dedicated_slots: Dict[str, Dict[str, int]],
+            low_priority_vms: Dict[str, Dict[str, int]],
+            low_priority_slots: Dict[str, Dict[str, int]],
+    ) -> Optional[str]:
+        # calculate pools of each
+        num_pools = {
+            'vms': {
+                'dedicated': {
+                    'idle': len(dedicated_vms['idle']),
+                    'avail': len(dedicated_vms['avail']),
+                },
+                'low_priority': {
+                    'idle': len(low_priority_vms['idle']),
+                    'avail': len(low_priority_vms['avail']),
+                }
+            },
+            'slots': {
+                'dedicated': {
+                    'idle': len(dedicated_slots['idle']),
+                    'avail': len(dedicated_slots['avail']),
+                },
+                'low_priority': {
+                    'idle': len(low_priority_slots['idle']),
+                    'avail': len(low_priority_slots['avail']),
+                }
+            }
+        }
+        # bin all maps
+        binned = {
+            'vms': {
+                'dedicated': {
+                    'idle': sorted(
+                        dedicated_vms['idle'],
+                        key=dedicated_vms['idle'].get,
+                        reverse=True),
+                    'avail': sorted(
+                        dedicated_vms['avail'],
+                        key=dedicated_vms['avail'].get,
+                        reverse=True),
+                },
+                'low_priority': {
+                    'idle': sorted(
+                        low_priority_vms['idle'],
+                        key=low_priority_vms['idle'].get,
+                        reverse=True),
+                    'avail': sorted(
+                        low_priority_vms['avail'],
+                        key=low_priority_vms['avail'].get,
+                        reverse=True),
+                }
+            },
+            'slots': {
+                'dedicated': {
+                    'idle': sorted(
+                        dedicated_slots['idle'],
+                        key=dedicated_slots['idle'].get,
+                        reverse=True),
+                    'avail': sorted(
+                        dedicated_slots['avail'],
+                        key=dedicated_slots['avail'].get,
+                        reverse=True),
+                },
+                'low_priority': {
+                    'idle': sorted(
+                        low_priority_slots['idle'],
+                        key=low_priority_slots['idle'].get,
+                        reverse=True),
+                    'avail': sorted(
+                        low_priority_slots['avail'],
+                        key=low_priority_slots['avail'].get,
+                        reverse=True),
+                }
+            }
+        }
+        # scheduling is done by slots (regular tasks) or vms (multi-instance)
+        if constraints.task.has_multi_instance:
+            total_slots_required = None
+            vms_required_per_task = constraints.task.instance_counts_max
+        else:
+            total_slots_required = constraints.task.instance_counts_total
+            vms_required_per_task = None
+        # greedy smallest-fit (by vms or slots) matching
+        selected = None
+        # constraint: dedicated only pools
+        if (constraints.pool.low_priority_nodes_allow is not None and
+                not constraints.pool.low_priority_nodes_allow):
+            if total_slots_required is not None:
+                selected = self._select_pool_for_target_required(
+                    total_slots_required, constraints.pool.autoscale_allow,
+                    num_pools['slots']['dedicated'],
+                    binned['slots']['dedicated'], dedicated_slots)
+            else:
+                selected = self._select_pool_for_target_required(
+                    vms_required_per_task, constraints.pool.autoscale_allow,
+                    num_pools['vms']['dedicated'],
+                    binned['vms']['dedicated'], dedicated_vms)
+        elif constraints.pool.low_priority_nodes_exclusive:
+            # constraint: low priority only pools
+            if total_slots_required is not None:
+                selected = self._select_pool_for_target_required(
+                    total_slots_required, constraints.pool.autoscale_allow,
+                    num_pools['slots']['low_priority'],
+                    binned['slots']['low_priority'], low_priority_slots)
+            else:
+                selected = self._select_pool_for_target_required(
+                    vms_required_per_task, constraints.pool.autoscale_allow,
+                    num_pools['vms']['low_priority'],
+                    binned['vms']['low_priority'], low_priority_vms)
+        else:
+            # no constraints, try scheduling on dedicated first, then low pri
+            if total_slots_required is not None:
+                selected = self._select_pool_for_target_required(
+                    total_slots_required, constraints.pool.autoscale_allow,
+                    num_pools['slots']['dedicated'],
+                    binned['slots']['dedicated'], dedicated_slots)
+                if selected is None:
+                    selected = self._select_pool_for_target_required(
+                        total_slots_required, constraints.pool.autoscale_allow,
+                        num_pools['slots']['low_priority'],
+                        binned['slots']['low_priority'], low_priority_slots)
+            else:
+                selected = self._select_pool_for_target_required(
+                    vms_required_per_task, constraints.pool.autoscale_allow,
+                    num_pools['vms']['dedicated'],
+                    binned['vms']['dedicated'], dedicated_vms)
+                if selected is None:
+                    selected = self._select_pool_for_target_required(
+                        vms_required_per_task,
+                        constraints.pool.autoscale_allow,
+                        num_pools['vms']['low_priority'],
+                        binned['vms']['low_priority'], low_priority_vms)
+        return selected
 
     def find_target_pool_for_job(
             self,
@@ -1497,11 +1821,22 @@ class Federation():
         """
         This function should be called with lock already held!
         """
-        # refresh all pools in federation
-        avail_dedicated_vms = {}
-        avail_lowpriority_vms = {}
-        idle_dedicated_vms = {}
-        idle_lowpriority_vms = {}
+        dedicated_vms = {
+            'idle': {},
+            'avail': {},
+        }
+        dedicated_slots = {
+            'idle': {},
+            'avail': {},
+        }
+        low_priority_vms = {
+            'idle': {},
+            'avail': {},
+        }
+        low_priority_slots = {
+            'idle': {},
+            'avail': {},
+        }
         # TODO Parallelize
         # TODO optimization -> fast match against last schedule?
         for rk in self.pools:
@@ -1509,7 +1844,7 @@ class Federation():
                 continue
             pool = self.pools[rk]
             # refresh pool
-            if pool.requires_update:
+            if pool.pool_requires_update:
                 pool.cloud_pool = bsh.get_pool_full_update(
                     pool.batch_account, pool.service_url, pool.pool_id)
                 if not pool.is_valid:
@@ -1520,55 +1855,66 @@ class Federation():
                 blacklist.add(rk)
                 continue
             # refresh node state counts
-            if unique_id != pool.node_counts_refresh_epoch:
+            if pool.node_counts_requires_update:
                 pool.node_counts = bsh.get_node_state_counts(
                     pool.batch_account, pool.service_url, pool.pool_id)
-                pool.node_counts_refresh_epoch = unique_id
+                if pool.node_counts is None:
+                    continue
             # further constraint matching for nodes
             if self._filter_pool_nodes_with_constraints(
                     pool, constraints, unique_id):
-                # TODO pickup here
-                pass
-
+                continue
             # add counts for pre-sort
             if pool.node_counts.dedicated.idle > 0:
-                idle_dedicated_vms[rk] = pool.node_counts.dedicated.idle
+                dedicated_vms['idle'][rk] = pool.node_counts.dedicated.idle
+                dedicated_slots['idle'][rk] = (
+                    pool.node_counts.dedicated.idle *
+                    pool.cloud_pool.max_tasks_per_node
+                )
             if pool.node_counts.low_priority.idle > 0:
-                idle_lowpriority_vms[rk] = pool.node_counts.low_priority.idle
-            avail_dedicated_vms[rk] = (
-                pool.node_counts.dedicated.idle +
-                pool.node_counts.dedicated.running
-            )
-            if avail_dedicated_vms[rk] == 0:
-                avail_dedicated_vms.pop(rk)
-            avail_lowpriority_vms[rk] = (
-                pool.node_counts.low_priority.idle +
-                pool.node_counts.low_priority.running
-            )
-            if avail_lowpriority_vms[rk] == 0:
-                avail_lowpriority_vms.pop(rk)
-
-        # TODO handle when there are no pools that can be matched
-
-        if len(idle_dedicated_vms) == 0 and len(idle_lowpriority_vms) == 0:
-            if (len(avail_dedicated_vms) != 0 or
-                    len(avail_lowpriority_vms) != 0):
-                binned_avail_dedicated = sorted(
-                    avail_dedicated_vms, key=avail_dedicated_vms.get)
-                if len(binned_avail_dedicated) > 0:
-                    return binned_avail_dedicated[0]
-                binned_avail_lp = sorted(
-                    avail_lowpriority_vms, key=avail_lowpriority_vms.get)
-                return binned_avail_lp[0]
+                low_priority_vms['idle'][rk] = (
+                    pool.node_counts.low_priority.idle
+                )
+                low_priority_slots['idle'][rk] = (
+                    pool.node_counts.low_priority.idle *
+                    pool.cloud_pool.max_tasks_per_node
+                )
+            if pool.schedulable_dedicated_nodes > 0:
+                dedicated_vms['avail'][rk] = pool.schedulable_dedicated_nodes
+                dedicated_slots['avail'][rk] = (
+                    pool.schedulable_dedicated_nodes *
+                    pool.cloud_pool.max_tasks_per_node
+                )
+            if pool.schedulable_low_priority_nodes > 0:
+                low_priority_vms['avail'][rk] = (
+                    pool.schedulable_low_priority_nodes
+                )
+                low_priority_slots['avail'][rk] = (
+                    pool.schedulable_low_priority_nodes *
+                    pool.cloud_pool.max_tasks_per_node
+                )
+        # check for non-availability
+        if (len(dedicated_vms['avail']) == 0 and
+                len(low_priority_vms['avail']) == 0):
+            logger.warning(
+                'no available nodes to schedule uid {} in fed {} fed '
+                'hash {}'.format(unique_id, self.id, self.hash))
+            return None
+        # perform greedy matching
+        schedule = self._greedy_best_fit_match_for_job(
+            num_tasks, constraints, unique_id, dedicated_vms, dedicated_slots,
+            low_priority_vms, low_priority_slots)
+        if schedule is None:
+            logger.warning(
+                'could not match uid {} in fed {} fed hash {} to any '
+                'pool'.format(unique_id, self.id, self.hash))
         else:
-            binned_idle_dedicated = sorted(
-                idle_dedicated_vms, key=idle_dedicated_vms.get)
-            if len(binned_idle_dedicated) > 0:
-                return binned_idle_dedicated[0]
-            binned_idle_lp = sorted(
-                idle_lowpriority_vms, key=idle_lowpriority_vms.get)
-            return binned_idle_lp[0]
-        return None
+            logger.info(
+                'selected pool id {} hash {} for uid {} in fed {} fed '
+                'hash {}'.format(
+                    self.pools[schedule].pool_id, schedule, unique_id,
+                    self.id, self.hash))
+        return schedule
 
     async def create_job_schedule(
             self,
@@ -1681,7 +2027,7 @@ class Federation():
             target_pool: str,
             job_id: str,
             is_job_schedule: bool,
-            unique_id: str,
+            unique_id: Optional[str],
     ) -> None:
         # get pool ref
         pool = self.pools[target_pool]
@@ -1697,23 +2043,34 @@ class Federation():
                 'PoolId': pool.pool_id,
                 'BatchAccount': pool.batch_account,
                 'ServiceUrl': pool.service_url,
-                'AdditionTimestamps': datetime_utcnow(as_string=True),
-                'UniqueIds': unique_id,
             }
+            if is_not_empty(unique_id):
+                entity['UniqueIds'] = unique_id
+                entity['AdditionTimestamps'] = datetime_utcnow(as_string=True)
         else:
-            entity['AdditionTimestamps'] = '{},{}'.format(
-                entity['AdditionTimestamps'], datetime_utcnow(as_string=True))
-            if (len(entity['AdditionTimestamps']) >
-                    self._MAX_STR_ENTITY_PROPERTY_LENGTH):
-                tmp = entity['AdditionTimestamps'].split(',')
-                entity['AdditionTimestamps'] = ','.join(tmp[-32:])
-                del tmp
-            entity['UniqueIds'] = '{},{}'.format(
-                entity['UniqueIds'], datetime_utcnow(as_string=True))
-            if len(entity['UniqueIds']) > self._MAX_STR_ENTITY_PROPERTY_LENGTH:
-                tmp = entity['UniqueIds'].split(',')
-                entity['UniqueIds'] = ','.join(tmp[-32:])
-                del tmp
+            if is_not_empty(unique_id):
+                try:
+                    entity['AdditionTimestamps'] = '{},{}'.format(
+                        entity['AdditionTimestamps'], datetime_utcnow(
+                            as_string=True))
+                except KeyError:
+                    entity['AdditionTimestamps'] = datetime_utcnow(
+                        as_string=True)
+                if (len(entity['AdditionTimestamps']) >
+                        fdh._MAX_STR_ENTITY_PROPERTY_LENGTH):
+                    tmp = entity['AdditionTimestamps'].split(',')
+                    entity['AdditionTimestamps'] = ','.join(tmp[-32:])
+                    del tmp
+                try:
+                    entity['UniqueIds'] = '{},{}'.format(
+                        entity['UniqueIds'], unique_id)
+                except KeyError:
+                    entity['UniqueIds'] = unique_id
+                if (len(entity['UniqueIds']) >
+                        fdh._MAX_STR_ENTITY_PROPERTY_LENGTH):
+                    tmp = entity['UniqueIds'].split(',')
+                    entity['UniqueIds'] = ','.join(tmp[-32:])
+                    del tmp
         logger.debug(
             'upserting location entity for job {} on pool {} uid={}'
             '(batch_account={} service_url={})'.format(
@@ -1721,31 +2078,55 @@ class Federation():
                 pool.service_url))
         fdh.upsert_location_entity_for_job(entity)
 
-    def fixup_task_for_ib_mismatch(
+    def fixup_task_for_mismatch(
             self,
-            ib_mismatch: str,
+            node_agent: str,
+            ib_mismatch: bool,
             task: batchmodels.TaskAddParameter,
             constraints: Constraints,
     ) -> batchmodels.TaskAddParameter:
-        if ib_mismatch == 'sles':
-            final = (
-                '/etc/dat.conf:/etc/rdma/dat.conf:ro --device=/dev/hvnd_rdma'
-            )
-        else:
-            final = '/etc/dat.conf:/etc/rdma/dat.conf:ro'
-        if constraints.task.has_multi_instance:
-            # fixup coordination command line
-            cc = task.multi_instance_settings.coordination_command_line
-            cc = cc.replace(
+        # fix up env vars for gpu and/or non-native
+        if ((constraints.compute_node.gpu or not constraints.pool.native) and
+                task.environment_settings is not None):
+            replace_ev = []
+            for ev in task.environment_settings:
+                if ev.name == 'CUDA_CACHE_PATH':
+                    replace_ev.append(batchmodels.EnvironmentSetting(
+                        ev.name,
+                        '{}/batch/tasks/.nv/ComputeCache'.format(
+                            get_temp_disk_for_node_agent(node_agent))
+                    ))
+                elif ev.name == 'SINGULARITY_CACHEDIR':
+                    replace_ev.append(batchmodels.EnvironmentSetting(
+                        ev.name,
+                        '{}/singularity/cache'.format(
+                            get_temp_disk_for_node_agent(node_agent))
+                    ))
+                else:
+                    replace_ev.append(ev)
+            task.environment_settings = replace_ev
+        # fix up ib rdma mapping in command line
+        if ib_mismatch:
+            if node_agent.startswith('batch.node.sles'):
+                final = (
+                    '/etc/dat.conf:/etc/rdma/dat.conf:ro '
+                    '--device=/dev/hvnd_rdma'
+                )
+            else:
+                final = '/etc/dat.conf:/etc/rdma/dat.conf:ro'
+            if constraints.task.has_multi_instance:
+                # fixup coordination command line
+                cc = task.multi_instance_settings.coordination_command_line
+                cc = cc.replace(
+                    '/etc/rdma:/etc/rdma:ro',
+                    '/etc/dat.conf:/etc/dat.conf:ro').replace(
+                        '/etc/rdma/dat.conf:/etc/dat.conf:ro', final)
+                task.multi_instance_settings.coordination_command_line = cc
+            # fixup command line
+            task.command_line = task.command_line.replace(
                 '/etc/rdma:/etc/rdma:ro',
                 '/etc/dat.conf:/etc/dat.conf:ro').replace(
                     '/etc/rdma/dat.conf:/etc/dat.conf:ro', final)
-            task.multi_instance_settings.coordination_command_line = cc
-        # fixup command line
-        task.command_line = task.command_line.replace(
-            '/etc/rdma:/etc/rdma:ro',
-            '/etc/dat.conf:/etc/dat.conf:ro').replace(
-                '/etc/rdma/dat.conf:/etc/dat.conf:ro', final)
         return task
 
     def schedule_tasks(
@@ -1762,20 +2143,20 @@ class Federation():
         """
         # get pool ref
         pool = self.pools[target_pool]
+        na = pool.cloud_pool.virtual_machine_configuration.\
+            node_agent_sku_id.lower()
         # check if there is an ib mismatch
-        ib_mismatch = None
-        if is_rdma_pool(pool.vm_size):
-            na = pool.cloud_pool.node_agent_sku_id.lower()
-            if na.startswith('batch.node.ubuntu'):
-                ib_mismatch = 'ubuntu'
-            elif na.startswith('batch.node.sles'):
-                ib_mismatch = 'sles'
+        ib_mismatch = (
+            is_rdma_pool(pool.vm_size) and
+            not na.startswith('batch.node.centos')
+        )
         # re-assign task ids to current job:
         # 1. sort task map keys
         # 2. re-map task ids to current job
         # 3. re-map merge task dependencies
         last_tid = None
         tasklist = None
+        merge_task_id = None
         task_ids = sorted(task_map.keys())
         for tid in task_ids:
             is_merge_task = tid == constraints.task.merge_task_id
@@ -1784,9 +2165,8 @@ class Federation():
                 last_task_id=last_tid, tasklist=tasklist,
                 is_merge_task=is_merge_task)
             task = task_map.pop(tid)
-            if ib_mismatch is not None:
-                task = self.fixup_task_for_ib_mismatch(
-                    task, ib_mismatch, constraints.task.has_multi_instance)
+            task = self.fixup_task_for_mismatch(
+                na, ib_mismatch, task, constraints)
             task_map[new_tid] = task
             if is_merge_task:
                 merge_task_id = new_tid
@@ -1880,7 +2260,7 @@ class FederationProcessor():
         naming: TaskNaming,
         task_map: Dict[str, batchmodels.TaskAddParameter],
         unique_id: str
-    ) -> None:
+    ) -> bool:
         # get the number of tasks in job
         # try to match the appropriate pool for the tasks in job
         # add job to pool
@@ -1889,14 +2269,10 @@ class FederationProcessor():
         # record mapping in fedjobs table
         num_tasks = len(task_map)
         logger.debug(
-            'attempting to match job {} with {} tasks in fed {} '
-            'uid={} constraints={} naming={}'.format(
-                job.id, num_tasks, fedhash, unique_id, constraints, naming))
+            'attempting to match job {} with {} tasks in fed {} uid={}'.format(
+                job.id, num_tasks, fedhash, unique_id))
         blacklist = set()
         while True:
-            # TODO implement graylist and blacklist
-            # blacklist = cannot schedule
-            # graylist = avoid scheduling
             poolrk = self.federations[fedhash].find_target_pool_for_job(
                 self.bsh, num_tasks, constraints, blacklist, unique_id)
             if poolrk is not None:
@@ -1904,15 +2280,18 @@ class FederationProcessor():
                     self.bsh, poolrk, job, constraints)
                 if cj:
                     self.federations[fedhash].track_job(
-                        self.fdh, poolrk, job.id, False, unique_id)
+                        self.fdh, poolrk, job.id, False, None)
                     self.federations[fedhash].schedule_tasks(
                         self.bsh, poolrk, job.id, constraints, naming,
                         task_map)
+                    self.federations[fedhash].track_job(
+                        self.fdh, poolrk, job.id, False, unique_id)
                     break
                 else:
                     blacklist.add(poolrk)
             else:
-                await asyncio.sleep(1 + random.randint(0, 5))
+                return False
+        return True
 
     async def add_job_schedule_v1(
         self,
@@ -1920,7 +2299,7 @@ class FederationProcessor():
         job_schedule: batchmodels.JobScheduleAddParameter,
         constraints: Constraints,
         unique_id: str
-    ) -> None:
+    ) -> bool:
         # ensure there is no existing job schedule. although this is checked
         # at submission time, a similarly named job schedule can be enqueued
         # multiple times before the action is dequeued
@@ -1932,13 +2311,9 @@ class FederationProcessor():
         num_tasks = constraints.task.tasks_per_recurrence
         logger.debug(
             'attempting to match job schedule {} with {} tasks in fed {} '
-            'uid={} constraints={}'.format(
-                job_schedule.id, num_tasks, fedhash, unique_id, constraints))
+            'uid={}'.format(job_schedule.id, num_tasks, fedhash, unique_id))
         blacklist = set()
         while True:
-            # TODO implement graylist and blacklist
-            # blacklist = cannot schedule
-            # graylist = avoid scheduling
             poolrk = self.federations[fedhash].find_target_pool_for_job(
                 self.bsh, num_tasks, constraints, blacklist, unique_id)
             if poolrk is not None:
@@ -1951,7 +2326,8 @@ class FederationProcessor():
                 else:
                     blacklist.add(poolrk)
             else:
-                await asyncio.sleep(1 + random.randint(0, 5))
+                return False
+        return True
 
     async def _terminate_job(
         self,
@@ -2030,21 +2406,33 @@ class FederationProcessor():
         data: Dict[str, Any],
         unique_id: str
     ) -> bool:
+        result = True
         # check proper version
         if is_not_empty(data) and data['version'] != '1':
             logger.error('cannot process job data version {} for {}'.format(
                 data['version'], unique_id))
-            return True
+            return result
         # extract data from message
         action = data['action']['method']
         target_type = data['action']['kind']
         target = data[target_type]['id']
+        logger.debug(
+            'uid {} for fed {} message action={} target_type={} '
+            'target={}'.format(
+                unique_id, fedhash, action, target_type, target))
         # take action depending upon kind and method
         if target_type == 'job_schedule':
             if action == 'add':
                 job_schedule = data[target_type]['data']
+                logger.debug(
+                    'uid {} for fed {} target_type={} target={} '
+                    'constraints={}'.format(
+                        unique_id, fedhash, target_type, target,
+                        json.dumps(
+                            data[target_type]['constraints'],
+                            indent=4, sort_keys=True)))
                 constraints = Constraints(data[target_type]['constraints'])
-                await self.add_job_schedule_v1(
+                result = await self.add_job_schedule_v1(
                     fedhash, job_schedule, constraints, unique_id)
             elif action == 'terminate':
                 await self.delete_or_terminate_job_v1(
@@ -2057,10 +2445,24 @@ class FederationProcessor():
         elif target_type == 'job':
             if action == 'add':
                 job = data[target_type]['data']
+                logger.debug(
+                    'uid {} for fed {} target_type={} target={} '
+                    'constraints={}'.format(
+                        unique_id, fedhash, target_type, target,
+                        json.dumps(
+                            data[target_type]['constraints'],
+                            indent=4, sort_keys=True)))
                 constraints = Constraints(data[target_type]['constraints'])
+                logger.debug(
+                    'uid {} for fed {} target_type={} target={} '
+                    'naming={}'.format(
+                        unique_id, fedhash, target_type, target,
+                        json.dumps(
+                            data[target_type]['task_naming'],
+                            indent=4, sort_keys=True)))
                 naming = TaskNaming(data[target_type]['task_naming'])
                 task_map = data['task_map']
-                await self.add_job_v1(
+                result = await self.add_job_v1(
                     fedhash, job, constraints, naming, task_map, unique_id)
             elif action == 'terminate':
                 await self.delete_or_terminate_job_v1(
@@ -2072,7 +2474,7 @@ class FederationProcessor():
                 raise NotImplementedError()
         else:
             logger.error('unknown target type: {}'.format(target_type))
-        return True
+        return result
 
     async def process_queue_message_v1(
             self,
@@ -2123,11 +2525,14 @@ class FederationProcessor():
             del data
         del blob_url
         # process message
+        result = True
         if job_data is not None:
-            await self.process_message_action_v1(fedhash, job_data, unique_id)
+            result = await self.process_message_action_v1(
+                fedhash, job_data, unique_id)
             # delete blob
-            self.fdh.delete_blob(blob_client, container, blob_name)
-        return True, target
+            if result:
+                self.fdh.delete_blob(blob_client, container, blob_name)
+        return result, target
 
     async def process_federation_queue(self, fedhash: str) -> None:
         acquired = self.federations[fedhash].lock.acquire(blocking=False)

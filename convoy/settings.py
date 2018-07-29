@@ -335,12 +335,14 @@ FederationPoolConstraintSettings = collections.namedtuple(
     'FederationPoolConstraintSettings', [
         'native', 'windows', 'location', 'custom_image_arm_id',
         'virtual_network_arm_id', 'low_priority_nodes_allow',
-        'low_priority_nodes_exclusive',
+        'low_priority_nodes_exclusive', 'autoscale_allow',
+        'autoscale_exclusive',
     ]
 )
 FederationComputeNodeConstraintSettings = collections.namedtuple(
     'FederationComputeNodeConstraintSettings', [
-        'vm_size', 'cores', 'memory', 'gpu', 'infiniband',
+        'vm_size', 'cores', 'core_variance', 'memory', 'memory_variance',
+        'exclusive', 'gpu', 'infiniband',
     ]
 )
 FederationConstraintSettings = collections.namedtuple(
@@ -3036,6 +3038,11 @@ def job_federation_constraint_settings(conf, federation_id):
         return None
     fc_conf = _kv_read_checked(conf, 'federation_constraints', default={})
     pool_conf = _kv_read_checked(fc_conf, 'pool', default={})
+    native = _kv_read(pool_conf, 'native')
+    windows = _kv_read(pool_conf, 'windows')
+    if windows and native is not None and not native:
+        raise ValueError(
+            'cannot set constraint windows as true and native as false')
     pool_location = _kv_read_checked(pool_conf, 'location')
     if pool_location is not None:
         pool_location = pool_location.lower()
@@ -3049,16 +3056,36 @@ def job_federation_constraint_settings(conf, federation_id):
         pool_virtual_network_arm_id = pool_virtual_network_arm_id.lower()
     pool_lp_conf = _kv_read_checked(
         pool_conf, 'low_priority_nodes', default={})
+    lp_allow = _kv_read(pool_lp_conf, 'allow', default=True)
+    lp_exclusive = _kv_read(pool_lp_conf, 'exclusive', default=False)
+    if not lp_allow and lp_exclusive:
+        raise ValueError(
+            'cannot set constraint low_priority:allow to false and '
+            'low_priority:exclusive to true')
+    pool_as_conf = _kv_read_checked(
+        pool_conf, 'autoscale', default={})
+    autoscale_allow = _kv_read(pool_as_conf, 'allow', default=True)
+    autoscale_exclusive = _kv_read(pool_as_conf, 'exclusive', default=False)
+    if not autoscale_allow and autoscale_exclusive:
+        raise ValueError(
+            'cannot set constraint autoscale:allow to false and '
+            'autoscale:exclusive to true')
     node_conf = _kv_read_checked(fc_conf, 'compute_node', default={})
     vm_size = _kv_read_checked(node_conf, 'vm_size')
     if vm_size is not None:
         vm_size = vm_size.lower()
-    node_cores = _kv_read(node_conf, 'cores')
+    core_conf = _kv_read_checked(node_conf, 'cores', default={})
+    node_cores = _kv_read(core_conf, 'amount')
     if util.is_not_empty(vm_size) and node_cores is not None:
         raise ValueError(
             'cannot specify both vm_size and cores for compute_node '
             'constraint')
-    node_memory = _kv_read_checked(node_conf, 'memory')
+    node_core_variance = _kv_read(core_conf, 'schedulable_variance')
+    if node_core_variance is not None and node_core_variance < 0:
+        raise ValueError(
+            'cannot specify a negative cores:schedulable_variance')
+    memory_conf = _kv_read(node_conf, 'memory', default={})
+    node_memory = _kv_read_checked(memory_conf, 'amount')
     if util.is_not_empty(vm_size) and node_memory is not None:
         raise ValueError(
             'cannot specify both vm_size and memory for compute_node '
@@ -3073,6 +3100,10 @@ def job_federation_constraint_settings(conf, federation_id):
             raise ValueError(
                 'federation_constraints:compute_node:memory is a '
                 'non-positive value')
+    node_memory_variance = _kv_read(memory_conf, 'schedulable_variance')
+    if node_memory_variance is not None and node_memory_variance < 0:
+        raise ValueError(
+            'cannot specify a negative memory:schedulable_variance')
     node_gpu = _kv_read(node_conf, 'gpu')
     if node_gpu and util.is_not_empty(vm_size) and not is_gpu_pool(vm_size):
         raise ValueError(
@@ -3084,20 +3115,23 @@ def job_federation_constraint_settings(conf, federation_id):
             'RDMA/IB')
     return FederationConstraintSettings(
         pool=FederationPoolConstraintSettings(
-            native=_kv_read(pool_conf, 'native'),
-            windows=_kv_read(pool_conf, 'windows'),
+            native=native,
+            windows=windows,
             location=pool_location,
             custom_image_arm_id=pool_custom_image_arm_id,
             virtual_network_arm_id=pool_virtual_network_arm_id,
-            low_priority_nodes_allow=_kv_read(
-                pool_lp_conf, 'allow', default=True),
-            low_priority_nodes_exclusive=_kv_read(
-                pool_lp_conf, 'exclusive', default=False),
+            low_priority_nodes_allow=lp_allow,
+            low_priority_nodes_exclusive=lp_exclusive,
+            autoscale_allow=autoscale_allow,
+            autoscale_exclusive=autoscale_exclusive,
         ),
         compute_node=FederationComputeNodeConstraintSettings(
             vm_size=vm_size,
             cores=node_cores,
+            core_variance=node_core_variance,
             memory=node_memory,
+            memory_variance=node_memory_variance,
+            exclusive=_kv_read(node_conf, 'exclusive', default=False),
             gpu=node_gpu,
             infiniband=node_ib,
         ),
@@ -3894,6 +3928,11 @@ def task_settings(
         # get num instances
         num_instances = conf['multi_instance']['num_instances']
         if not isinstance(num_instances, int):
+            if util.is_not_empty(federation_id):
+                raise ValueError(
+                    'cannot specify a non-integral value "{}" for '
+                    'num_instances for a multi-instance task destined for '
+                    'a federation'.format(num_instances))
             # TODO remove deprecation path
             if (num_instances == 'pool_specification_vm_count_dedicated' or
                     num_instances == 'pool_specification_vm_count'):

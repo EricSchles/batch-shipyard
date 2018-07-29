@@ -683,7 +683,7 @@ def list_federations(table_client, config, federation_ids):
     """
     log = []
     if util.is_not_empty(federation_ids):
-        log.append('listing federations: {}'.format(federation_ids))
+        log.append('listing federations: {}'.format(', '.join(federation_ids)))
         fedhashset = set()
         fedhashmap = {}
         for x in federation_ids:
@@ -1132,7 +1132,7 @@ def list_jobs_in_federation(
                         'type': kind,
                     }
                 else:
-                    log.append('* {}'.format(target))
+                    log.append('* id: {}'.format(target))
                     log.append('  * type: {}'.format(kind))
             if settings.raw(config):
                 log[target]['pool'] = {

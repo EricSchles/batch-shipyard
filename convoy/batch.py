@@ -4090,7 +4090,7 @@ def _construct_task(
     #        settings.BatchShipyardSettings, bool, bool, str, bool,
     #        list, list, batchmodels.CloudPool, settings.PoolSettings,
     #        dict, str, dict, dict, list, str, str, bool, bool,
-    #        batchmodels.OnTaskFailure, dict) -> str
+    #        batchmodels.OnTaskFailure, dict) -> tuple
     """Contruct a Batch task and add it to the task map
     :param batch_client: The batch client to use.
     :type batch_client: `azure.batch.batch_service_client.BatchServiceClient`
@@ -4119,7 +4119,8 @@ def _construct_task(
     :param batchmodels.OntaskFailure on_task_failure: on task failure
     :param dict _task: task spec
     :rtype: tuple
-    :return: (list of committed task ids for job, task id added to task map)
+    :return: (list of committed task ids for job, task id added to task map,
+        instance count for task)
     """
     _task_id = settings.task_id(_task)
     if util.is_none_or_empty(_task_id):
@@ -4134,6 +4135,7 @@ def _construct_task(
     task = settings.task_settings(
         cloud_pool, config, pool, jobspec, _task)
     is_singularity = util.is_not_empty(task.singularity_image)
+    task_ic = 1
     # retrieve keyvault task env vars
     if util.is_not_empty(
             task.environment_variables_keyvault_secret_id):
@@ -4229,6 +4231,7 @@ def _construct_task(
             coordination_command_line=cc,
             common_resource_files=[],
         )
+        task_ic = task.multi_instance.num_instances
         del cc
         # add common resource files for multi-instance
         if util.is_not_empty(task.multi_instance.resource_files):
@@ -4462,7 +4465,7 @@ def _construct_task(
             'duplicate task id detected: {} for job {}'.format(
                 task.id, job_id))
     task_map[task.id] = batchtask
-    return existing_tasklist, task.id
+    return existing_tasklist, task.id, task_ic
 
 
 def add_jobs(
@@ -4561,6 +4564,8 @@ def add_jobs(
         )
         existing_tasklist = None
         has_merge_task = settings.job_has_merge_task(jobspec)
+        max_instance_count_in_job = 0
+        instances_required_in_job = 0
         for task in settings.job_tasks(config, jobspec):
             # check if task docker image is set in config.json
             di = settings.task_docker_image(task)
@@ -4952,7 +4957,7 @@ def add_jobs(
         # add all tasks under job
         task_map = {}
         for _task in settings.job_tasks(config, jobspec):
-            existing_tasklist, lasttaskid = _construct_task(
+            existing_tasklist, lasttaskid, lasttaskic = _construct_task(
                 batch_client, blob_client, keyvault_client, config,
                 federation_id, bxfile, bs, native, is_windows, tempdisk,
                 allow_run_on_missing, docker_missing_images,
@@ -4960,9 +4965,12 @@ def add_jobs(
                 pool, jobspec, job_id, job_env_vars, task_map,
                 existing_tasklist, reserved_task_id, lasttaskid, False,
                 uses_task_dependencies, on_task_failure, _task)
+            instances_required_in_job += lasttaskic
+            if lasttaskic > max_instance_count_in_job:
+                max_instance_count_in_job = lasttaskic
         if has_merge_task:
             _task = settings.job_merge_task(jobspec)
-            existing_tasklist, merge_task_id = _construct_task(
+            existing_tasklist, merge_task_id, lasttaskic = _construct_task(
                 batch_client, blob_client, keyvault_client, config,
                 federation_id, bxfile, bs, native, is_windows, tempdisk,
                 allow_run_on_missing, docker_missing_images,
@@ -4970,6 +4978,9 @@ def add_jobs(
                 pool, jobspec, job_id, job_env_vars, task_map,
                 existing_tasklist, reserved_task_id, lasttaskid, True,
                 uses_task_dependencies, on_task_failure, _task)
+            instances_required_in_job += lasttaskic
+            if lasttaskic > max_instance_count_in_job:
+                max_instance_count_in_job = lasttaskic
             # set dependencies on merge task
             merge_task = task_map.pop(merge_task_id)
             merge_task.depends_on = batchmodels.TaskDependencies(
@@ -5033,14 +5044,23 @@ def add_jobs(
                         'data': jobschedule,
                         'constraints': {
                             'pool': {
+                                'autoscale': {
+                                    'allow':
+                                    fed_constraints.pool.autoscale_allow,
+                                    'exclusive':
+                                    fed_constraints.pool.autoscale_exclusive,
+                                },
                                 'custom_image_arm_id':
                                 fed_constraints.pool.custom_image_arm_id,
                                 'location': fed_constraints.pool.location,
-                                'low_priority_nodes_allow':
-                                fed_constraints.pool.low_priority_nodes_allow,
-                                'low_priority_nodes_exclusive':
-                                fed_constraints.pool.
-                                low_priority_nodes_exclusive,
+                                'low_priority_nodes': {
+                                    'allow':
+                                    fed_constraints.pool.
+                                    low_priority_nodes_allow,
+                                    'exclusive':
+                                    fed_constraints.pool.
+                                    low_priority_nodes_exclusive,
+                                },
                                 'native': native,
                                 'virtual_network_arm_id':
                                 fed_constraints.pool.virtual_network_arm_id,
@@ -5049,10 +5069,21 @@ def add_jobs(
                             'compute_node': {
                                 'vm_size':
                                 fed_constraints.compute_node.vm_size,
-                                'cores':
-                                fed_constraints.compute_node.cores,
-                                'memory':
-                                fed_constraints.compute_node.memory,
+                                'cores': {
+                                    'amount':
+                                    fed_constraints.compute_node.cores,
+                                    'scheduleable_variance':
+                                    fed_constraints.compute_node.core_variance,
+                                },
+                                'memory': {
+                                    'amount':
+                                    fed_constraints.compute_node.memory,
+                                    'scheduleable_variance':
+                                    fed_constraints.compute_node.
+                                    memory_variance,
+                                },
+                                'exclusive':
+                                fed_constraints.compute_node.exclusive,
                                 'gpu':
                                 fed_constraints.compute_node.gpu,
                                 'infiniband':
@@ -5060,6 +5091,10 @@ def add_jobs(
                             },
                             'task': {
                                 'has_multi_instance': multi_instance,
+                                'instance_counts': {
+                                    'max': max_instance_count_in_job,
+                                    'total': instances_required_in_job,
+                                },
                                 'tasks_per_recurrence': len(task_map),
                             },
                         },
@@ -5123,14 +5158,23 @@ def add_jobs(
                         'data': job,
                         'constraints': {
                             'pool': {
+                                'autoscale': {
+                                    'allow':
+                                    fed_constraints.pool.autoscale_allow,
+                                    'exclusive':
+                                    fed_constraints.pool.autoscale_exclusive,
+                                },
                                 'custom_image_arm_id':
                                 fed_constraints.pool.custom_image_arm_id,
                                 'location': fed_constraints.pool.location,
-                                'low_priority_nodes_allow':
-                                fed_constraints.pool.low_priority_nodes_allow,
-                                'low_priority_nodes_exclusive':
-                                fed_constraints.pool.
-                                low_priority_nodes_exclusive,
+                                'low_priority_nodes': {
+                                    'allow':
+                                    fed_constraints.pool.
+                                    low_priority_nodes_allow,
+                                    'exclusive':
+                                    fed_constraints.pool.
+                                    low_priority_nodes_exclusive,
+                                },
                                 'native': native,
                                 'virtual_network_arm_id':
                                 fed_constraints.pool.virtual_network_arm_id,
@@ -5139,10 +5183,21 @@ def add_jobs(
                             'compute_node': {
                                 'vm_size':
                                 fed_constraints.compute_node.vm_size,
-                                'cores':
-                                fed_constraints.compute_node.cores,
-                                'memory':
-                                fed_constraints.compute_node.memory,
+                                'cores': {
+                                    'amount':
+                                    fed_constraints.compute_node.cores,
+                                    'scheduleable_variance':
+                                    fed_constraints.compute_node.core_variance,
+                                },
+                                'memory': {
+                                    'amount':
+                                    fed_constraints.compute_node.memory,
+                                    'scheduleable_variance':
+                                    fed_constraints.compute_node.
+                                    memory_variance,
+                                },
+                                'exclusive':
+                                fed_constraints.compute_node.exclusive,
                                 'gpu':
                                 fed_constraints.compute_node.gpu,
                                 'infiniband':
@@ -5151,6 +5206,10 @@ def add_jobs(
                             'task': {
                                 'auto_complete': auto_complete,
                                 'has_multi_instance': multi_instance,
+                                'instance_counts': {
+                                    'max': max_instance_count_in_job,
+                                    'total': instances_required_in_job,
+                                },
                             },
                         },
                         'task_naming': {

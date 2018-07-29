@@ -62,6 +62,9 @@ job_specifications:
   default_working_dir: batch
   federation_constraints:
     pool:
+      autoscale:
+        allow: true
+        exclusive: false
       low_priority_nodes:
         allow: true
         exclusive: false
@@ -72,8 +75,13 @@ job_specifications:
       virtual_network_arm_id: null
     compute_node:
       vm_size: STANDARD_F1
-      cores: 2
-      memory: 512m
+      cores:
+        amount: 2
+        schedulable_variance: null
+      memory:
+        amount: 512m
+        schedulable_variance: null
+      exclusive: false
       gpu: false
       infiniband: false
   tasks:
