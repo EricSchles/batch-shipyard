@@ -1,5 +1,0 @@
-job_specifications:
-- id: caffejob
-  tasks:
-  - docker_image: alfpark/caffe:gpu
-    command: /caffe/run_mnist.sh -gpu all

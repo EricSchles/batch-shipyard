@@ -1,8 +1,0 @@
-job_specifications:
-- id: chainerjob
-  tasks:
-  - docker_image: chainer/chainer
-    resource_files:
-    - blob_source: https://raw.githubusercontent.com/pfnet/chainer/master/examples/mnist/train_mnist.py
-      file_path: train_mnist.py
-    command: python -u train_mnist.py

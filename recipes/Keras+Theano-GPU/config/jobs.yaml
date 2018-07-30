@@ -1,5 +1,0 @@
-job_specifications:
-- id: kerasjob
-  tasks:
-  - docker_image: alfpark/keras:gpu
-    command: python -u /keras/examples/mnist_cnn.py
