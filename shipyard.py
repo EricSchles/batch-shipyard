@@ -858,6 +858,123 @@ def monitor_options(f):
     return f
 
 
+class Cluster:
+    def __init__(self, context):
+        self.ctx = context
+
+class Disks:
+    def __init__(self, context):
+        self.ctx = context
+        
+class FileSystem:
+    def __init__(self, context):
+        self.ctx = context
+        self.cluster = Cluster(context)
+        self.disks = Disks(context)
+        
+class SAS:
+    def __init__(self, context):
+        self.ctx = context
+
+class Storage:
+    def __init__(self, context):
+        self.ctx = context
+        self.sas = SAS(context)
+        
+
+class Account:
+    def __init__(self, context):
+        self.ctx = context
+        
+    def info(self, name, resource_group):
+        
+class Keyvault:
+    def __init__(self, context):
+        self.ctx = context
+
+class Cert:
+    def __init__(self, context):
+        self.ctx = context
+
+class Autoscale:
+    def __init__(self, context):
+        self.ctx = context
+
+class Images:
+    def __init__(self, context):
+        self.ctx = context
+
+class User:
+    def __init__(self, context):
+        self.ctx = context
+
+class Nodes:
+    def __init__(self, context):
+        self.ctx = context
+
+        
+class Pool:
+    def __init__(self, context):
+        self.ctx = context
+        self.autoscale = Autoscale(context)
+        self.images = Images(context)
+        self.user = User(context)
+        self.nodes = Nodes(context)
+
+class Tasks:
+    def __init__(self, context):
+        self.ctx = context
+
+        
+class Jobs:
+    def __init__(self, context):
+        self.ctx = context
+        self.tasks = Tasks(context)
+
+        
+class Files:
+    def __init__(self, context):
+        self.ctx = context
+
+        
+class Data:
+    def __init__(self, context):
+        self.ctx = context
+        self.files = Files(context)
+
+class Diag:
+    def __init__(self, context):
+        self.ctx = context
+        self.logs = Logs(context)
+    
+class Logs:
+    def __init__(self, context):
+        self.ctx = context
+
+class Misc:
+    def __init__(self, context):
+        self.ctx = context
+
+class Monitor:
+    def __init__(self, context):
+        self.ctx = context
+        
+        
+class Shipyard:
+    def __init__(self):
+        self.ctx = CliContext()
+        self.account = Account(self.ctx)
+        self.fs = FileSystem(self.ctx)
+        self.storage = Storage(self.ctx)
+        self.keyvault = Keyvault(self.ctx)
+        self.cert = Cert(self.ctx)
+        self.pool = Pool(self.ctx)
+        self.jobs = Jobs(self.ctx)
+        self.data = Data(self.ctx)
+        self.diag = Diag(self.ctx)
+        self.misc = Misc(self.ctx)
+        self.monitor = Monitor(self.ctx)
+        
 @click.group(context_settings=_CONTEXT_SETTINGS)
 @click.version_option(version=convoy.__version__)
 @click.pass_context
@@ -888,7 +1005,7 @@ def account_info(ctx, name, resource_group):
     convoy.fleet.action_account_info(
         ctx.batch_mgmt_client, ctx.config, name, resource_group)
 
-
+    
 @account.command('list')
 @click.option('--resource-group', help='Scope query to resource group')
 @common_options
